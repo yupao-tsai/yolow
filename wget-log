@@ -1,0 +1,6 @@
+--2024-12-08 08:53:16--  https://storage.googleapis.com/kaggle-data-sets/643881/1141873/compressed/obj.zip?X-Goog-Algorithm=GOOG4-RSA-SHA256
+正在查找主機 storage.googleapis.com (storage.googleapis.com)... 142.250.66.91, 142.250.198.91, 142.250.204.59, ...
+正在連接 storage.googleapis.com (storage.googleapis.com)|142.250.66.91|:443... 連上了。
+已送出 HTTP 要求，正在等候回應... 400 Bad Request
+2024-12-08 08:53:16 錯誤 400: Bad Request。
+
