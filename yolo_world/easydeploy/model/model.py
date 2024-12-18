@@ -3,10 +3,15 @@ from copy import deepcopy
 from functools import partial
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from mmdet.models.backbones.csp_darknet import Focus
 from mmdet.models.layers import ChannelAttention
+from mmdet.models.utils import (
+    multi_apply,
+    unpack_gt_instances,
+    filter_scores_and_topk)
 from mmengine.config import ConfigDict
 from torch import Tensor
 
@@ -27,11 +32,19 @@ class DeployModel(nn.Module):
     def __init__(self,
                  baseModel: nn.Module,
                  backend: MMYOLOBackend,
-                 postprocess_cfg: Optional[ConfigDict] = None):
+                 postprocess_cfg: Optional[ConfigDict] = None, 
+                 without_bbox_decoder=False):
         super().__init__()
         self.baseModel = baseModel
         self.baseHead = baseModel.bbox_head
         self.backend = backend
+        self.features = None
+        self.quant = torch.ao.quantization.QuantStub()
+        self.dequant = torch.ao.quantization.DeQuantStub()
+        self.without_bbox_decoder = without_bbox_decoder
+        self.data_norm = torch.tensor([[[[255, 255, 255]]]], dtype=torch.float32)
+        
+
         if postprocess_cfg is None:
             self.with_postprocess = False
         else:
@@ -122,14 +135,25 @@ class DeployModel(nn.Module):
                                                   self.num_classes)
             for cls_score in cls_scores
         ]
-        cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
-
         flatten_bbox_preds = [
             bbox_pred.permute(0, 2, 3, 1).reshape(num_imgs, -1, 4)
             for bbox_pred in bbox_preds
         ]
+        
+        ########
+        # data = {"flatten_stride":flatten_stride, "flatten_cls_scores":flatten_cls_scores, "flatten_bbox_preds":flatten_bbox_preds, "mlvl_priors":mlvl_priors}
+        # torch.save(data, "deploy_predict_by_feat.pt")
+        ########
+        cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
         flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
-
+        ########
+        # data = {"scores":cls_scores, "bbox":flatten_bbox_preds,"objectnesses":objectnesses}
+        # torch.save(data, "deploy_before_deocde.pt")
+        # bboxes = bbox_decoder(flatten_priors[None], flatten_bbox_preds,
+        #                       flatten_stride)
+        # data = bboxes
+        # torch.save(data, "deploy_after_deocde.pt")
+        ########
         if objectnesses is not None:
             flatten_objectness = [
                 objectness.permute(0, 2, 3, 1).reshape(num_imgs, -1)
@@ -140,6 +164,11 @@ class DeployModel(nn.Module):
 
         scores = cls_scores
 
+        bboxes = flatten_bbox_preds
+
+        if self.without_bbox_decoder:
+            return scores, bboxes
+        
         bboxes = bbox_decoder(flatten_priors[None], flatten_bbox_preds,
                               flatten_stride)
 
@@ -161,7 +190,21 @@ class DeployModel(nn.Module):
         return nms_func
 
     def forward(self, inputs: Tensor):
+        
+        # if hasattr(inputs, "node") and "device" in inputs.node.meta:
+        #     device = inputs.node.meta["device"]
+        #     self.data_norm = self.data_norm.to(device)
+        # else:
+        #     self.data_norm = self.data_norm.to(inputs)
+        # print(self.data_norm.device)
+        self.data_norm = self.data_norm.to(inputs.device)
+        # self.data_norm = self.data_norm.to(device=self.baseHead.device)
+        inputs = inputs.div(self.data_norm)
+        inputs = self.quant(inputs)
+        inputs = inputs.permute(0,3,1,2)
+        # inputs = inputs[0, [2,1,0], ...]
         neck_outputs = self.baseModel(inputs)
+        # self.features = neck_outputs
         if self.with_postprocess:
             return self.pred_by_feat(*neck_outputs)
         else:
@@ -177,8 +220,72 @@ class DeployModel(nn.Module):
                     else:
                         outputs.append(torch.cat(feats, 1).permute(0, 2, 3, 1))
             else:
-                for feats in zip(*neck_outputs):
-                    outputs.append(torch.cat(feats, 1))
+                # for feats in zip(*neck_outputs):
+                #     outputs.append(torch.cat(feats, 1))
+                self.num_classes = self.baseHead.num_classes
+                flatten_cls_scores = [
+                    cls_score.permute(0, 2, 3, 1).reshape(1, -1,
+                                                        self.num_classes)
+                    # cls_score.transpose(1,3).transpose(1,2).reshape(1, -1,
+                    #                                     self.num_classes)
+                    for cls_score in neck_outputs[0]
+                ]
+                flatten_bbox_preds = [
+                    bbox_pred.permute(0, 2, 3, 1).reshape(1, -1, 4)
+                    # bbox_pred.transpose(1,3).transpose(1,2).reshape(1, -1, 4)
+                    for bbox_pred in neck_outputs[1]
+                ]
+                
+                scores = torch.cat(flatten_cls_scores,1)
+                bboxes = torch.cat(flatten_bbox_preds,1)
+                score_thr = 0.05
+                nms_number = 64
+                # K = torch.tensor([1,2,4,8,16,],dtype=torch.uint8)
+                K = 64 #torch.tensor(32, dtype=torch.uint8)
+                # topk_scores, topk_labels, keep_idxs, _ = filter_scores_and_topk(
+                #     scores[0], score_thr, nms_number)
+                # values, indices = torch.topk(scores.reshape(-1), k=nms_number, dim=-1, largest=True, sorted=True)
+                
+                squeeze_scores = scores.squeeze(0)
+                squeeze_bboxes = bboxes.squeeze(0)
+                # Step 1: 对每个 anchor 的最大分数进行排序（仅在 topk_indices 范围内操作）
+                max_scores_per_anchor, max_class_per_anchor = torch.max(scores, dim=-1)  # shape: [1, 8400]
+                max_class_per_anchor=max_class_per_anchor.reshape(-1)
+                max_scores_per_anchor = torch.clamp(max_scores_per_anchor, min=-8, max=8) 
+                # max_class_per_anchor = torch.clamp(max_class_per_anchor, min=0, max=K)
+                max_class_per_anchor = max_class_per_anchor.to(dtype=torch.uint8)
+                # max_scores_per_anchor = max_scores_per_anchor.sigmoid()
+                max_scores_per_anchor2=max_scores_per_anchor.reshape(1,1,1,-1)
+                _, topk_indices = max_scores_per_anchor2.topk(K,dim=-1)  # shape: [1, 15]
+                topk_indices = topk_indices.reshape(-1)
+                topk_scores = max_scores_per_anchor.reshape(-1)[topk_indices].sigmoid()
+                topk_classes = max_class_per_anchor[topk_indices]
+                topk_bboxes = squeeze_bboxes[topk_indices,:]
+                
+                # topk_indices=topk_indices.reshape(-1)
+                # # Step 2: 仅在 topk_indices 范围内计算 sigmoid 并提取类别
+                # # 根据 topk_indices 提取 scores 的子集以减少计算量
+                
+                # selected_scores = squeeze_scores[topk_indices, :]  # shape: [15, 6]
+                # selected_sigmoid_scores = selected_scores.reshape(-1)  # 对子集计算 sigmoid，形状 [15, 6]
+                
+                # # 根据最大分数的类别索引，提取最终的分数
+                # squeeze_classes=max_class_per_anchor.squeeze(0)
+                # topk_classes = squeeze_classes[topk_indices]  # shape: [15]
+                # new_indices = torch.arange(K).to(device=topk_classes.device, dtype = torch.uint8)*selected_scores.shape[-1]+topk_classes.to(dtype=torch.uint8)
+                # new_indices = new_indices.to(dtype = torch.uint8)
+                # topk_scores = selected_sigmoid_scores[new_indices]  # shape: [15]
+                
+                # topk_bboxes = squeeze_bboxes[topk_indices,:]
+                # 如果需要扩展维度为 [1, 15]
+                # final_topk_scores = final_topk_scores.unsqueeze(0)  # shape: [1, 15]
+
+                # 输出
+                # outputs = [scores, bboxes, topk_scores, topk_classes, topk_indices, topk_bboxes]
+                # outputs = [self.dequant(topk_scores), self.dequant(topk_classes), self.dequant(topk_indices), self.dequant(topk_bboxes)]
+                outputs = [topk_scores, topk_classes, topk_indices, topk_bboxes]
+                # outputs = [scores, bboxes, max_scores_per_anchor, max_class_per_anchor, topk_indices]
+                # outputs = [scores, bboxes]
             return tuple(outputs)
 
     @staticmethod
