@@ -29,7 +29,8 @@ class MaxSigmoidAttnBlock(BaseModule):
                  norm_cfg: ConfigType = dict(type='BN',
                                              momentum=0.03,
                                              eps=0.001),
-                 init_cfg: OptMultiConfig = None) -> None:
+                 init_cfg: OptMultiConfig = None,
+                 use_einsum: bool = False) -> None:
         super().__init__(init_cfg=init_cfg)
         conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
 
@@ -38,6 +39,7 @@ class MaxSigmoidAttnBlock(BaseModule):
             'out_channels and embed_channels should be divisible by num_heads.'
         self.num_heads = num_heads
         self.head_channels = out_channels // num_heads
+        self.use_einsum = use_einsum
 
         self.embed_conv = ConvModule(
             in_channels,
@@ -69,20 +71,59 @@ class MaxSigmoidAttnBlock(BaseModule):
         guide = self.guide_fc(guide)
         guide = guide.reshape(B, -1, self.num_heads, self.head_channels)
         embed = self.embed_conv(x) if self.embed_conv is not None else x
-        embed = embed.reshape(B, self.num_heads, self.head_channels, H, W)
+        # embed = embed.reshape(B, self.num_heads, self.head_channels, H, W)
+        embed = embed.reshape(self.num_heads, self.head_channels, H, W)
 
-        attn_weight = torch.einsum('bmchw,bnmc->bmhwn', embed, guide)
+        if self.use_einsum:
+            # attn_weight = torch.einsum('bmchw,bnmc->bmhwn', embed, guide)
+            attn_weight = torch.einsum('bmchw,bnmc->bmhwn', embed, guide)
+        else:
+            # embed_old = embed.reshape(B, self.num_heads, self.head_channels, H, W)
+            # batch, m, channel, height, width = embed_old.shape
+            # _, n, _, _ = guide.shape
+            # embed_old = embed_old.permute(0, 1, 3, 4, 2)
+            # embed_old = embed_old.reshape(batch, m, -1, channel)
+            # guide_old = guide.permute(0, 2, 3, 1)
+            # attn_weight = torch.matmul(embed_old, guide_old)
+            # attn_weight_old = attn_weight.reshape(batch, m, height, width, n)
+            
+            m, channel, height, width = embed.shape
+            _, n, _, _ = guide.shape
+            embed = embed.permute(0, 2,3,1)
+            embed = embed.reshape(1, m, -1, channel)
+            guide = guide.permute(0, 2, 3, 1)
+            attn_weight = torch.matmul(embed, guide)
+            attn_weight = attn_weight.reshape(m, height, width, n)
+        
+        # attn_weight_old = attn_weight_old.max(dim=-1)[0]
+        # attn_weight_old = attn_weight_old / (self.head_channels**0.5)
+        # attn_weight_old = attn_weight_old + self.bias[None, :, None, None]
+        # attn_weight_old = attn_weight_old.sigmoid() * self.scale
+        # x_old = x
+        # x_old = self.project_conv(x_old)
+        # x_old = x_old.reshape(B, self.num_heads, -1, H, W)
+        # x_old = x_old * attn_weight_old.unsqueeze(2)
+        # x_old = x_old.reshape(B, -1, H, W)
+        
         attn_weight = attn_weight.max(dim=-1)[0]
         attn_weight = attn_weight / (self.head_channels**0.5)
-        attn_weight = attn_weight + self.bias[None, :, None, None]
-        attn_weight = attn_weight.sigmoid() * self.scale
-
+        attn_weight = attn_weight + self.bias[:, None, None]
+        attn_weight = attn_weight.sigmoid() * self.scale        
+        
         x = self.project_conv(x)
-        x = x.reshape(B, self.num_heads, -1, H, W)
-        x = x * attn_weight.unsqueeze(2)
+        # x = x.reshape(B, self.num_heads, -1, H, W)
+        # x = x * attn_weight.unsqueeze(2)
+        x = x.reshape(self.num_heads, -1, H, W)
+        b = attn_weight.reshape(self.num_heads,-1,H,W)
+        x = x*b
+        # x = x * attn_weight #.unsqueeze(1)
         x = x.reshape(B, -1, H, W)
+                
+        # if torch.any(torch.abs(x-x_old)>1e-2):
+        #     print(f'x={x[0,0,0,:10]}')
+        #     print(f'x_old={x_old[0,0,0,:10]}')
+        
         return x
-
 
 @MODELS.register_module()
 class MaxSigmoidCSPLayerWithTwoConv(CSPLayerWithTwoConv):
