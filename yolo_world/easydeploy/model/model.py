@@ -197,11 +197,8 @@ class DeployModel(nn.Module):
         # else:
         #     self.data_norm = self.data_norm.to(inputs)
         # print(self.data_norm.device)
-        self.data_norm = self.data_norm.to(inputs.device)
         # self.data_norm = self.data_norm.to(device=self.baseHead.device)
-        inputs = inputs.div(self.data_norm)
-        inputs = self.quant(inputs)
-        inputs = inputs.permute(0,3,1,2)
+        # inputs = inputs.permute(0,3,1,2)
         # inputs = inputs[0, [2,1,0], ...]
         neck_outputs = self.baseModel(inputs)
         # self.features = neck_outputs
@@ -281,9 +278,9 @@ class DeployModel(nn.Module):
                 # final_topk_scores = final_topk_scores.unsqueeze(0)  # shape: [1, 15]
 
                 # 输出
-                # outputs = [scores, bboxes, topk_scores, topk_classes, topk_indices, topk_bboxes]
+                outputs = [scores, bboxes, topk_scores, topk_classes, topk_indices, topk_bboxes]
                 # outputs = [self.dequant(topk_scores), self.dequant(topk_classes), self.dequant(topk_indices), self.dequant(topk_bboxes)]
-                outputs = [topk_scores, topk_classes, topk_indices, topk_bboxes]
+                # outputs = [topk_scores, topk_classes, topk_indices, topk_bboxes]
                 # outputs = [scores, bboxes, max_scores_per_anchor, max_class_per_anchor, topk_indices]
                 # outputs = [scores, bboxes]
             return tuple(outputs)

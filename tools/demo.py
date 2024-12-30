@@ -1,6 +1,8 @@
 # Copyright (c) Tencent Inc. All rights reserved.
 import abc
 import copy
+import gc
+import json
 import os
 import random
 import traceback
@@ -13,6 +15,7 @@ from copy import deepcopy
 
 # import mtk_quantization.pytorch
 # import mtk_quantization.pytorch
+import mtk_quantization.pytorch
 import onnx
 from onnx import TensorProto
 from onnx.numpy_helper import to_array, from_array
@@ -27,7 +30,7 @@ import torch.optim as optim
 # import torch.ao.quantization.fx as fx
 # from torch.ao.quantization import get_default_qconfig_mapping
 from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
-from torch.ao.quantization import get_default_qat_qconfig_mapping, get_default_qat_qconfig
+from torch.ao.quantization import get_default_qat_qconfig_mapping, get_default_qat_qconfig, QuantStub, DeQuantStub
 # from torch.ao.quantization import fuse_fx
 import torch.ao.quantization as quantization
 import gradio as gr
@@ -42,6 +45,7 @@ from mmengine.dataset import Compose
 from mmdet.visualization import DetLocalVisualizer
 from mmdet.datasets import CocoDataset
 from mmyolo.registry import RUNNERS
+from tqdm import tqdm
 
 from yolo_world.easydeploy.model import DeployModel, MMYOLOBackend
 import tensorflow as tf
@@ -53,7 +57,52 @@ import os
 BOUNDING_BOX_ANNOTATOR = sv.BoundingBoxAnnotator()
 LABEL_ANNOTATOR = sv.LabelAnnotator(text_color=sv.Color.BLACK)
 
+def generate_calibrattion_data(runner):
+    import os
+    import random
+    import numpy as np
+
+    num_samples = 2000
+    root = "/storage/SSD-3/yptsai/data/coco2017/val2017"
+    image_list = [os.path.join(root, f) for f in os.listdir(root) if f.lower().endswith(('.jpg', '.png'))]
+    random.shuffle(image_list)
+    total_images = image_list[:num_samples]
+    dirs = ['Build_fire_detection_solutions.v1i.yolov8/train/images/', 'ASD.v8i.yolov8/train/images/', 'fire_detection.v2-fire-detection.yolov8.zip/train/images/','Fire_detection.v2i.yolov8/train/images/', 'kidBoy.v8i.yolov8/train/images/', 'Packages_on_Conveyor.v1i.yolov8/train/images/','piscina.v1i.yolov8/train/images/','pool/train/images/']
+    root = "/storage/SSD-3/yptsai/data/" 
+    spec_images=[] 
+    for d in dirs:
+        cur_path = root + d
+        image_list = [os.path.join(cur_path, f) for f in os.listdir(cur_path) if f.lower().endswith(('.jpg', '.png'))]
+        if len(image_list)>0:
+            spec_images.extend(image_list)
+    image_list = total_images
+    random.shuffle(spec_images)
+    num_samples = min(len(spec_images), num_samples)
+    image_list = image_list+spec_images[:num_samples*10]
+    random.shuffle(image_list)
+    num_samples = len(image_list)
+    text = "person, kid, pool, package, fire, car, lampost, swimming pool, stove, flame"
+    texts = [[t.strip()] for t in text.split(',')] + [[' ']]
+    
+    for idx, file in enumerate(tqdm(image_list[:num_samples])):
+        data_info = dict(img_id=0, img_path=file, texts=texts)
+        data_info = runner.pipeline(data_info)
+
+        data_batch = dict(
+            inputs=data_info['inputs'].unsqueeze(0),
+            data_samples=[data_info['data_samples']]
+        )
+        fake_input_2 = runner.model.data_preprocessor(data_batch, False)
+        np.save('/storage/SSD-3/yptsai/npy/batch_{}.npy'.format(idx), fake_input_2['inputs'].permute(0, 2, 3, 1).cpu().numpy())
+        # img_datas.append(fake_input_2['inputs'].permute(0, 2, 3, 1).cpu().numpy())
+    
+    # calib_datas = np.vstack(img_datas[:100])
+    # np.save(file='calibration_fie_package_pool_100.npy',arr=calib_datas)
+    # calib_datas = np.vstack(img_datas[:500])
+    # np.save(file='calibration_fie_package_pool_500.npy',arr=calib_datas)
+        
 def get_calibrattion_data(runner, text, use_static_data=False, num_samples=100):
+    
     import os
     import random
     import numpy as np
@@ -81,6 +130,7 @@ def get_calibrattion_data(runner, text, use_static_data=False, num_samples=100):
     random.shuffle(spec_images)
     num_samples = min(len(spec_images), num_samples)
     image_list = image_list+spec_images[:num_samples*10]
+    random.shuffle(image_list)
     num_samples = len(image_list)
     texts = [[t.strip()] for t in text.split(',')] + [[' ']]
     
@@ -88,14 +138,14 @@ def get_calibrattion_data(runner, text, use_static_data=False, num_samples=100):
         data_info = dict(img_id=0, img_path=file, texts=texts)
         data_info = runner.pipeline(data_info)
 
-        # data_batch = dict(
-        #     inputs=data_info['inputs'].unsqueeze(0),
-        #     data_samples=[data_info['data_samples']]
-        # )
-        # fake_input_2 = runner.model.data_preprocessor(data_batch, False)
+        data_batch = dict(
+            inputs=data_info['inputs'].unsqueeze(0),
+            data_samples=[data_info['data_samples']]
+        )
+        fake_input_2 = runner.model.data_preprocessor(data_batch, False)
 
-        # yield [fake_input_2['inputs'].permute(0, 2, 3, 1).cpu().numpy()]
-        yield [data_info['inputs'].to(dtype=torch.float32).unsqueeze(0)[:1,[2,1,0],...].permute(0, 2, 3, 1).cpu().numpy()]
+        yield [fake_input_2['inputs'].permute(0,2,3,1).cpu().numpy()]
+        # yield [data_info['inputs'].to(dtype=torch.float32).unsqueeze(0)[:1,[2,1,0],...].permute(0, 2, 3, 1).cpu().numpy()]
 def calibrate(model, data_loader):
     model.eval()
     with torch.no_grad():
@@ -174,30 +224,35 @@ class DataReader(CalibrationDataReader):
 #     activation=default_fake_quant,
 #     weight=default_weight_fake_quant
 # )
-
+target_backend = 'qnnpack'
 def set_qat_qconfig_all_layers(model, parent_name=''):
     """
     遍歷模型所有層，遞歸設置 QConfig。
     - nn.Embedding 使用 float_qparams_weight_only_qconfig
     - Conv/Linear 使用 custom_qconfig
     """
-    for name, module in model.named_children():
+    for name, module in model.named_modules():
         full_name = f"{parent_name}.{name}" if parent_name else name
+        print(f'module name = {name}')
 
-        if isinstance(module, nn.Embedding):
-            # 特殊處理 Embedding
-            module.qconfig = torch.ao.quantization.qconfig.float_qparams_weight_only_qconfig
-            print(f"[INFO] QConfig set for Embedding: {full_name}")
-        elif 'text' in name:
-            # 通用 QConfig
-            module.qconfig = None
-            print(f"[INFO] QConfig set None for text in: {full_name}")
-        elif 'data_preprocessor' in name:
-            module.qconfig = None
-            print(f"[INFO] QConfig set None for data_preprocessor in: {full_name}")
+        # 僅對 nn.Module 類型設置 qconfig
+        if isinstance(module, torch.nn.Module):
+            if isinstance(module, torch.nn.Embedding):
+                module.qconfig = None #torch.ao.quantization.qconfig.float_qparams_weight_only_qconfig
+                print(f"[INFO] QConfig set for Embedding: {full_name}")
+            elif 'text' in name:
+                module.qconfig = None
+                print(f"[INFO] QConfig set None for text in: {full_name}")
+            elif 'data_preprocessor' in name:
+                module.qconfig = None
+                print(f"[INFO] QConfig set None for data_preprocessor in: {full_name}")
+            else:
+                module.qconfig = torch.ao.quantization.get_default_qat_qconfig(target_backend)
+                # print(f'module = {type(module)}, name = {name}, qconfig = {getattr(module, "qconfig", "None")}')
+            # 遞歸處理
+            # set_qat_qconfig_all_layers(module, full_name)
         else:
-            # 遞歸處理子模組
-            set_qat_qconfig_all_layers(module, full_name)
+            print(f"[WARNING] Skipping non-module: {full_name} ({type(module)})")
 
 import torch.nn.quantized as nnq
 
@@ -271,10 +326,40 @@ def custom_convert(model):
             else:
                 setattr(model, name, nn.ReLU())
 
-from torch.ao.quantization import fuse_modules
+from torch.ao.quantization import fuse_modules_qat
+from mmyolo.models.layers.yolo_bricks import CSPLayerWithTwoConv
 
+def set_training(model, training = True):
+    for name, module in model.named_modules():
+        if isinstance(module,nn.Module):
+            module.train(training)
+
+def set_device(model, device='cpu'):
+    for name, module in model.named_modules():
+        if isinstance(module,nn.Module):
+            module.to(device=device)
+
+
+def move_model_to_device(model,device='cpu'):
+    # 將所有參數和緩衝區移動到 CPU
+    for param in model.parameters():
+        param.data = param.data.to(device)
+        if param.grad is not None:
+            param.grad.data = param.grad.data.to(device)
+
+    for buffer in model.buffers():
+        buffer.data = buffer.data.to(device)
+
+    # 遞歸處理所有子模塊
+    for submodule in model.children():
+        move_model_to_device(submodule,device=device)  
+                              
 def fuse_all_layers(module):
     for name, submodule in module.named_children():
+        print(f'fuse>> name = {name}, submoduel = {type(submodule)}')
+        if isinstance(submodule, CSPLayerWithTwoConv):
+            print(f'moduel = {type(submodule)}')
+            
         # 跳過不需要融合的模塊
         if isinstance(submodule, torch.nn.Identity) or isinstance(submodule, torch.nn.Conv2d):
             continue
@@ -282,21 +367,94 @@ def fuse_all_layers(module):
         # 如果子模塊有 conv, bn, activate，嘗試融合
         if hasattr(submodule, "conv") and hasattr(submodule, "bn") and hasattr(submodule, "activate"):
             try:
-                fuse_modules(submodule, ["conv", "bn", "activate"], inplace=True)
+                fuse_modules_qat(submodule, ["conv", "bn", "activate"], inplace=True)
+            except AssertionError as e:
+                print(f"Skipping fusion for {name}: {e}")
+        elif hasattr(submodule, "conv") and hasattr(submodule, "bn"):
+            try:
+                fuse_modules_qat(submodule, ["conv", "bn"], inplace=True)
+            except AssertionError as e:
+                print(f"Skipping fusion for {name}: {e}")
+        elif hasattr(submodule, "conv") and hasattr(submodule, "activate"):
+            try:
+                fuse_modules_qat(submodule, ["conv", "activate"], inplace=True)
+            except AssertionError as e:
+                print(f"Skipping fusion for {name}: {e}")
+        elif hasattr(submodule, "linear") and hasattr(submodule, "bn"):
+            try:
+                fuse_modules_qat(submodule, ["linear", "bn"], inplace=True)
+            except AssertionError as e:
+                print(f"Skipping fusion for {name}: {e}")
+        elif hasattr(submodule, "linear") and hasattr(submodule, "activate"):
+            try:
+                fuse_modules_qat(submodule, ["linear", "activate"], inplace=True)
             except AssertionError as e:
                 print(f"Skipping fusion for {name}: {e}")
         else:
             # 遞歸處理子模塊
             fuse_all_layers(submodule)
-                              
+
+class QDelopyModel(DeployModel):
+    def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
+        super().__init__(baseModel, backend, postprocess_cfg, without_bbox_decoder)
+        self.quant = torch.ao.quantization.QuantStub()
+        self.dequant = torch.ao.quantization.DeQuantStub()
+        del self.baseModel.data_preprocessor
+        
+    def forward(self, inputs):        
+        inputs = self.quant(inputs)
+        inputs = inputs.permute(0, 3, 1, 2)
+        outputs = super().forward(inputs)
+        return (self.dequant(outputs[0]),self.dequant(outputs[1]))
+
+class FQATDelopyModel(DeployModel):
+    def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
+        super().__init__(baseModel, backend, postprocess_cfg, without_bbox_decoder)
+    
+    def forward(self, inputs):
+        inputs = inputs.permute(0, 3, 1, 2)
+        outputs = super().forward(inputs)
+        return (outputs[0], outputs[1])
+        
+class FDelopyModel(DeployModel):
+    def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
+        super().__init__(baseModel, backend, postprocess_cfg, without_bbox_decoder)
+    
+    def forward(self, inputs):
+        inputs = inputs.permute(0, 3, 1, 2) #(B, C, H, W) -> (B, H, W, C)
+        outputs = super().forward(inputs)
+        return (outputs[2], outputs[3], outputs[4], outputs[5])
+
+class FDelopyModel2(DeployModel):
+    def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
+        super().__init__(baseModel, backend, postprocess_cfg, without_bbox_decoder)
+    
+    def forward(self, inputs):
+        inputs = inputs.permute(0, 3, 1, 2) #(B, C, H, W) -> (B, H, W, C)
+        outputs = super().forward(inputs)
+        return (outputs[0].sigmoid(), outputs[1])
+    
+class FDelopyModelUint(DeployModel):
+    def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
+        super().__init__(baseModel, backend, postprocess_cfg, without_bbox_decoder)
+    
+    def forward(self, inputs):
+        inputs = self.div(inputs, 255)
+        inputs = inputs.permute(0,3,1,2)
+        outputs = super().forward(inputs)
+        return (outputs[2], outputs[3], outputs[4], outputs[5])
+
+                                   
 def mtk_qat(runner, model, text, test_input):
     
     import mtk_converter
+    
     original_model = model
     original_model.eval()
 
     # 使用 deepcopy 複製模型
     quantized_model = copy.deepcopy(original_model)
+    float_model = copy.deepcopy(original_model)
     # quantized_model.train()
     data_preprocessor = quantized_model.baseModel.data_preprocessor
     quantized_model.baseModel.data_preprocessor = None
@@ -308,21 +466,567 @@ def mtk_qat(runner, model, text, test_input):
     # quantized_model = torch.ao.quantization.fuse_modules(quantized_model, modules_to_fuse)
     # quantized_model.fuse_model(is_qat=True)
     
-
     # The old 'fbgemm' is still available but 'x86' is the recommended default.
-    quantized_model.qconfig = torch.ao.quantization.get_default_qat_qconfig('qnnpack')
+    set_training(quantized_model,training=True)
+    replace_silu_recursive(quantized_model)
+    replace_silu_recursive(float_model)
+    # fuse_all_layers(quantized_model)
+    quantized_model.qconfig = torch.ao.quantization.get_default_qat_qconfig(target_backend)
+    
+    torch.ao.quantization.prepare_qat(quantized_model, inplace=True)
     set_qat_qconfig_all_layers(quantized_model)
+    # quantized_model = mtk_quantization.pytorch.fuse_modules(quantized_model, test_input)
+    # quantized_model = mtk_quantization.pytorch.ConfigGenerator(model)
+    # quantize_handler = mtk_quantization.pytorch.QuantizeHandler()
+    # quantized_model = quantize_handler.prepare(quantized_model,'./work_dirs/quant_config.json')
+    
     # 驗證所有層的 QConfig
     print("\n[INFO] Model QConfig settings:")
-    for name, module in quantized_model.named_modules():
-        if hasattr(module, 'qconfig') and module.qconfig:
-            print(f"{name}: {module.qconfig}")
-    replace_silu_recursive(quantized_model)
+    # for name, module in quantized_model.named_modules():
+    #     if hasattr(module, 'qconfig') and module.qconfig:
+    #         print(f"{name}: {module.qconfig}")
+    # replace_silu_recursive(quantized_model)
     # quantized_model.eval()
-    fuse_all_layers(quantized_model)
+    # quantized_model = fuse_modules_qat(quantized_model,[['conv','bn','activate'],['conv','bn']])
+    set_training(model=quantized_model,training=True)
+    # fuse_all_layers(quantized_model)
     # replace_embedding_with_quantized(quantized_model)
-    quantized_model.train()
+    # quantized_model.train()
+    
+    
+    # 模擬訓練
+    optimizer = optim.Adam(quantized_model.parameters(), lr=1e-3)
+    mse_loss = nn.MSELoss()
+    batch=4
+    num_data=1000
+    total_loss=0
+    def calibration_data_function():
+        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+    # 訓練迴圈
+    for epoch in range(10):
+        with tqdm(calibration_data_function(), desc=f'QAT epoch-{epoch}:') as pbar:
+            for i, input_tensor in enumerate(pbar):
+                if isinstance(input_tensor, list):
+                    input_tensor = input_tensor[0]
+                if isinstance(input_tensor, np.ndarray):
+                    input_tensor = torch.from_numpy(input_tensor).to(test_input.device)
+                with torch.no_grad():
+                    original_output = original_model(input_tensor) #/255)  # 原始模型輸出
+
+                quantized_output = quantized_model(input_tensor)#/255)  # 量化模型輸出
+
+                # 逐元素計算損失
+                for j in range(2):
+                    element_loss = mse_loss(quantized_output[j].float(), original_output[j].float())  # 計算每個元素的 MSE
+                    total_loss += element_loss  # 累加損失
+                if i%batch==(batch-1):
+                    total_loss = total_loss / batch
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
+                    # print(f"Step {i + 1}, Loss: {total_loss.item()}")
+                    # tqdm.write(f'Loss: {total_loss.item():.4f}')
+                    pbar.set_postfix(loss=total_loss.item()) 
+                    total_loss=0
+            if epoch > 3:
+                # Freeze quantizer parameters
+                quantized_model.apply(torch.ao.quantization.disable_observer)
+            if epoch > 2:
+                # Freeze batch norm mean and variance estimates
+                quantized_model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
+            
+    # 7. 將 QAT 模型轉換為量化模型
+    # quantized_model.eval()
+    # quantized_model = convert_fx(quantized_model)
+    # Check the accuracy after each epoch
+    # torch.save(quantized_model.state_dict(), './work_dirs/state_dict.pt')
+    # quantized_model.load_state_dict(torch.load('./work_dirs/state_dict.pt'))
+    
+    set_training(quantized_model,training=False)
+    move_model_to_device(quantized_model,'cpu')
+    with torch.no_grad():
+        torch.jit.save(torch.jit.trace(quantized_model.cpu().eval(), torch.randn(1,640,640,3)), './work_dirs/quantized_model.pt')
+        
+        def replace_identity(module):
+            if 'ConvModule' in str(type(module)):
+                if hasattr(module, "bn") and 'Identity' in str(type(module.bn)):
+                    module.with_norm = False
+                    module.bn = nn.Identity()                
+                if hasattr(module, "norm") and 'Identity' in str(type(module.norm)):
+                    module.with_norm = False
+                    module.norm = nn.Identity()
+                if hasattr(module, "activate") and 'Identity' in str(type(module.activate)):
+                    module.with_activation = False
+                    module.activation = nn.Identity()
+                if hasattr(module, "act") and 'Identity' in str(type(module.activate)):
+                    module.with_activation = False
+                    module.activation = nn.Identity()
+            elif 'TopK' in str(type(module)):
+                print(module)
+            # elif isinstance(module, (torch.nn.quantized.Quantize, torch.nn.quantized.DeQuantize)):
+            #     module = torch.nn.Identity()
+                    
+            for name, child in module.named_children():
+                print(f'name = {name}, child = {type(child)}')
+                if isinstance(child, torch.nn.modules.linear.Identity):
+                    # setattr(module, name, nn.Sequential())  # 替換為 nn.Sequential
+                    if 'bn' in name:
+                        setattr(module,"with_norm", False)
+                    elif 'norm' in name:
+                        setattr(module, "with_norm", False)
+                    elif 'activate' in name:
+                        setattr(module, "with_activation", False)
+                    elif 'act' in name:
+                        setattr(module, "with_activation", False)
+                else:
+                    replace_identity(child)
+
+        
+        quantized_model = torch.ao.quantization.convert(quantized_model, inplace=True)
+        
+        def remove_quantization_modules(model):
+            for name, module in model.named_children():
+                if isinstance(module, (QuantStub, DeQuantStub)):
+                    setattr(model, name, torch.nn.Identity())  # 替換為空操作
+                else:
+                    remove_quantization_modules(module)
+
+        remove_quantization_modules(quantized_model)  
+        
+
+        # 保存量化模型
+        torch.save(quantized_model.state_dict(), "qat_model.pth")
+
+        # 加載檢查點
+        state_dict = torch.load("qat_model.pth")
+
+        # 解量化並過濾額外鍵值
+        for key, value in state_dict.items():
+            if isinstance(value, torch.Tensor) and value.is_quantized:
+                state_dict[key] = value.dequantize()
+
+        filtered_state_dict = {k: v for k, v in state_dict.items() if k in float_model.state_dict().keys()}
+
+        # 加載到未量化模型
+        float_model.load_state_dict(filtered_state_dict)
+        set_training(float_model,training=False)
+        move_model_to_device(float_model,'cpu')
+        
+        with BytesIO() as f:
+            # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+            output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+            # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+            # output_names = ['scores','boxes']
+            torch.onnx.export(
+                float_model.cpu(),
+                test_input.cpu(),
+                f,
+                input_names=['images'],
+                output_names=output_names,
+                do_constant_folding=True,
+                opset_version=13)
+            f.seek(0)
+            onnx_model = onnx.load(f)
+            onnx.checker.check_model(onnx_model)
+            onnx_model, check = onnxsim.simplify(onnx_model)
+            onnx.save(onnx_model, "after_quan.onnx")
+        # return None
+        # ############### 
+        
+        # replace_identity(quantized_model)
+        # # Step 1: 移除 hooks
+        # def remove_hooks(module):
+        #     for name, child in module.named_children():
+        #         if isinstance(child, (QuantStub, DeQuantStub)):
+        #             child._forward_hooks.clear()
+        #             child._backward_hooks.clear()
+        #         remove_hooks(child)
+
+        # remove_hooks(quantized_model)
+        
+        # set_training(quantized_model,training=False)
+        # move_model_to_device(quantized_model,"cpu")
+        
+        # scripted_model = torch.jit.script(quantized_model)
+        # quantized_model=quantized_model.eval()
+        # # fuse_all_layers(quantized_model)
+
+        # remove_qconfig(quantized_model)
+        # scripted_model = torch.jit.script(quantized_model)
+        # converter = mtk_converter.PyTorchConverter.from_script_module_file('./work_dirs/quantized_model.pt',[[1,640,640,3]])
+        # converter.quantize=True
+        # converter.input_value_ranges=[(0,1)]
+        # converter.convert_to_tflite(output_file='quantized_model.tflite')
+        # # set_device(quantized_model)
+        # scripted_model = torch.jit.trace(quantized_model.cpu(),(test_input/255).cpu())
+        # torch.jit.save(torch.jit.trace(quantized_model.cpu().eval(), torch.randn(1,640,640,3)), './work_dirs/model.pt')
+        
+        # scripted_model = torch.jit.script(quantized_model.cpu())
+        # custom_convert(quantized_model)
+        # with BytesIO() as f:
+        #     # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+        #     # output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        #     output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        #     # output_names = ['scores','boxes']
+        #     torch.onnx.export(
+        #         quantized_model.cpu(),
+        #         test_input.cpu(),
+        #         f,
+        #         input_names=['images'],
+        #         output_names=output_names,
+        #         do_constant_folding=True,
+        #         opset_version=13)
+        #     f.seek(0)
+        #     onnx_model = onnx.load(f)
+        #     onnx.checker.check_model(onnx_model)
+        #     onnx_model, check = onnxsim.simplify(onnx_model)
+        #     onnx.save(onnx_model, "after_quan.onnx")
+    # 1. 保存量化後模型為 TorchScript
+    # scripted_model = torch.jit.script(quantized_model)
+
+    # move_model_to_cpu(quantized_model)
+    # quantized_model = quantized_model.to(device)
+    # scripted_model= torch.jit.trace(quantized_model, test_input.to(device))
+    # scripted_model.save("scripted_model.pt")
+    # print("Quantized model saved as TorchScript (quantized_model.pt)")
+    # mtk_converter.PyTorchV2Converter.from_exported_program(scripted_model,input_shapes=[(1,640,640,3)])
+    
+    # # 8. 測試量化後的模型
+    # with torch.no_grad():
+    #     # test_input = torch.randn(1, 3, 8, 8)
+    #     output = quantized_model(test_input/255)
+    #     print("Quantized Model Output:", output)
+
+    # # 9. 保存量化後模型為 TorchScript
+    # scripted_model = torch.jit.script(quantized_model)
+    # scripted_model.save("quantized_model.pt")
+    # print("Quantized model saved as TorchScript (quantized_model.pt)")
+    
+    # with BytesIO() as f:
+    #     # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+    #     # output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+    #     output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+    #     # output_names = ['scores','boxes']
+    #     torch.onnx.export(
+    #         scripted_model,
+    #         test_input,
+    #         f,
+    #         input_names=['images'],
+    #         output_names=output_names,
+    #         do_constant_folding=True,
+    #         opset_version=13)
+    #     f.seek(0)
+    #     onnx_model = onnx.load(f)
+    #     onnx.checker.check_model(onnx_model)
+    #     onnx_model, check = onnxsim.simplify(onnx_model)
+    #     onnx.save(onnx_model, "after_quan.onnx")
+    #################
+    # graph = onnx_model.graph
+
+    # # 修改輸出名稱
+    # for output in graph.output:
+    #     print(output.name)
+    # # 遍历节点，找到 TopK 操作
+    # for node in graph.node:
+    #     if node.op_type == "TopK":
+    #         print(f"Found TopK Node: {node.name}")
+            
+    #         # 确定 TopK 的第二个输入（k 值）的名字
+    #         k_input_name = node.input[1]
+    #         print(f"K input name: {k_input_name}")
+            
+    #         indices_output_name = node.output[1]
+    #         print(f"Indices output name: {indices_output_name}")
+    #         # 遍历初始化器，找到对应的 k
+    #         for initializer in graph.initializer:
+    #             if initializer.name == k_input_name:
+    #                 print(f"Found initializer for K: {initializer.name}")
+                    
+    #                 # 转换为 NumPy 数组
+    #                 k_array = to_array(initializer)
+                    
+    #                 # 检查 k 是否是形状为 [1] 的张量
+    #                 if k_array.shape == (1,):
+    #                     print(f"Original K value: {k_array}")
+
+    #                     # 修改为形状为 [] 的标量
+    #                     k_scalar = k_array.item()  # 提取标量值
+    #                     new_initializer = from_array(
+    #                         np.array(k_scalar, dtype=k_array.dtype).reshape(()),
+    #                         name=initializer.name
+    #                     )                        
+    #                     # 替换原来的初始化器
+    #                     graph.initializer.remove(initializer)
+    #                     graph.initializer.append(new_initializer)
+    #                     print(f"Modified K to scalar: {k_scalar}")
+    #             # elif initializer.name == indices_output_name:
+    #             #     nitializer_found = True
+    #             #     print(f"Modifying initializer {initializer.name}")
+                    
+    #             #     # 提取數據並轉換為 uint8
+    #             #     original_data = to_array(initializer)
+    #             #     converted_data = original_data.astype(np.uint8)
+                    
+    #             #     # 創建新的初始化器
+    #             #     new_initializer = from_array(
+    #             #         converted_data, name=initializer.name)
+                    
+    #             #     # 替換舊的初始化器
+    #             #     graph.initializer.remove(initializer)
+    #             #     graph.initializer.append(new_initializer)
+                    
+    #         # 修改形状信息
+    #         for value_info in graph.value_info:
+    #             if value_info.name == k_input_name:
+    #                 print(f"Before modification: {value_info}")
+    #                 value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+    #                 value_info.type.tensor_type.elem_type = TensorProto.INT64  # 设置数据类型
+    #                 print(f"After modification: {value_info}")
+    #             # elif value_info.name == indices_output_name:
+    #             #     print(f"Before modification: {value_info}")
+    #             #     # value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+    #             #     value_info.type.tensor_type.elem_type = TensorProto.UINT8  # 设置数据类型
+    #                 # print(f"After modification: {value_info}")
+    # # 保存模型
+    # modified_filename = "modified_model.onnx"
+    # onnx.save(onnx_model, modified_filename) 
+    # print("Model saved as modified_model.onnx")
+    # print("call mtk_calibration_and_export_tflite")
+    del quantized_model
+    del onnx_model
+    move_model_to_device(float_model,device="cuda")
+    test_input = test_input.to("cuda")
+    return mtk_calibration_and_export_tflite(runner=runner, model=float_model,text=text, test_input=test_input)
+
+
+def mtk_qat2(runner, model, text, test_input):
+    
+    import mtk_converter
+    
+    original_model = FQATDelopyModel(baseModel=model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    original_model.eval()
+
+    # 使用 deepcopy 複製模型
+    copy_model = copy.deepcopy(original_model)
+    quantized_model = QDelopyModel(baseModel=copy_model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    copy_model2 = copy.deepcopy(original_model)
+    float_model = FDelopyModel(baseModel=copy_model2.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    # 3. 設定量化配置 (QAT)
+    # qconfig_mapping = get_default_qat_qconfig("fbgemm")  # CPU-friendly量化配置
+    # quantized_model = prepare_qat_fx(quantized_model, qconfig_mapping, test_input)    
+    # modules_to_fuse = [ ['conv1', 'bn1', 'relu1'], ['submodule.conv', 'submodule.relu']]
+    # quantized_model = torch.ao.quantization.fuse_modules(quantized_model, modules_to_fuse)
+    # quantized_model.fuse_model(is_qat=True)
+    
+    # The old 'fbgemm' is still available but 'x86' is the recommended default.
+    set_training(quantized_model,training=True)
+    # replace_silu_recursive(quantized_model)
+    # fuse_all_layers(quantized_model)
+    quantized_model.qconfig = torch.ao.quantization.get_default_qat_qconfig(target_backend)
+    
     torch.ao.quantization.prepare_qat(quantized_model, inplace=True)
+    set_qat_qconfig_all_layers(quantized_model)
+    # quantized_model = mtk_quantization.pytorch.fuse_modules(quantized_model, test_input)
+    # quantized_model = mtk_quantization.pytorch.ConfigGenerator(model)
+    # quantize_handler = mtk_quantization.pytorch.QuantizeHandler()
+    # quantized_model = quantize_handler.prepare(quantized_model,'./work_dirs/quant_config.json')
+    
+    # 驗證所有層的 QConfig
+    print("\n[INFO] Model QConfig settings:")
+    # for name, module in quantized_model.named_modules():
+    #     if hasattr(module, 'qconfig') and module.qconfig:
+    #         print(f"{name}: {module.qconfig}")
+    # replace_silu_recursive(quantized_model)
+    # quantized_model.eval()
+    # quantized_model = fuse_modules_qat(quantized_model,[['conv','bn','activate'],['conv','bn']])
+    set_training(model=quantized_model,training=True)
+    # fuse_all_layers(quantized_model)
+    # replace_embedding_with_quantized(quantized_model)
+    # quantized_model.train()
+    
+    
+    # 模擬訓練
+    optimizer = optim.Adam(quantized_model.parameters(), lr=1e-3)
+    mse_loss = nn.MSELoss()
+    batch=4
+    num_data=1000
+    total_loss=0
+    def calibration_data_function():
+        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+    # 訓練迴圈
+    for epoch in range(10):
+        with tqdm(calibration_data_function(), desc=f'QAT epoch-{epoch}:') as pbar:
+            for i, input_tensor in enumerate(pbar):
+                if isinstance(input_tensor, list):
+                    input_tensor = input_tensor[0]
+                if isinstance(input_tensor, np.ndarray):
+                    input_tensor = torch.from_numpy(input_tensor).to(test_input.device)
+                with torch.no_grad():
+                    original_output = original_model(input_tensor) #/255)  # 原始模型輸出
+
+                quantized_output = quantized_model(input_tensor)#/255)  # 量化模型輸出
+
+                # 逐元素計算損失
+                for j in range(2):
+                    element_loss = mse_loss(quantized_output[j].float(), original_output[j].float())  # 計算每個元素的 MSE
+                    total_loss += element_loss  # 累加損失
+                if i%batch==(batch-1):
+                    total_loss = total_loss / batch
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
+                    # print(f"Step {i + 1}, Loss: {total_loss.item()}")
+                    # tqdm.write(f'Loss: {total_loss.item():.4f}')
+                    pbar.set_postfix(loss=total_loss.item()) 
+                    total_loss=0
+            if epoch > 3:
+                # Freeze quantizer parameters
+                quantized_model.apply(torch.ao.quantization.disable_observer)
+            if epoch > 2:
+                # Freeze batch norm mean and variance estimates
+                quantized_model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
+    
+    set_training(quantized_model,training=False)
+    move_model_to_device(quantized_model,'cpu')
+    with torch.no_grad():
+        torch.jit.save(torch.jit.trace(quantized_model.cpu().eval(), torch.randn(1,640,640,3)), './work_dirs/quantized_model.pt')
+        
+        def replace_identity(module):
+            if 'ConvModule' in str(type(module)):
+                if hasattr(module, "bn") and 'Identity' in str(type(module.bn)):
+                    module.with_norm = False
+                    module.bn = nn.Identity()                
+                if hasattr(module, "norm") and 'Identity' in str(type(module.norm)):
+                    module.with_norm = False
+                    module.norm = nn.Identity()
+                if hasattr(module, "activate") and 'Identity' in str(type(module.activate)):
+                    module.with_activation = False
+                    module.activation = nn.Identity()
+                if hasattr(module, "act") and 'Identity' in str(type(module.activate)):
+                    module.with_activation = False
+                    module.activation = nn.Identity()
+            elif 'TopK' in str(type(module)):
+                print(module)
+            # elif isinstance(module, (torch.nn.quantized.Quantize, torch.nn.quantized.DeQuantize)):
+            #     module = torch.nn.Identity()
+                    
+            for name, child in module.named_children():
+                print(f'name = {name}, child = {type(child)}')
+                if isinstance(child, torch.nn.modules.linear.Identity):
+                    # setattr(module, name, nn.Sequential())  # 替換為 nn.Sequential
+                    if 'bn' in name:
+                        setattr(module,"with_norm", False)
+                    elif 'norm' in name:
+                        setattr(module, "with_norm", False)
+                    elif 'activate' in name:
+                        setattr(module, "with_activation", False)
+                    elif 'act' in name:
+                        setattr(module, "with_activation", False)
+                else:
+                    replace_identity(child)
+
+        
+        quantized_model = torch.ao.quantization.convert(quantized_model, inplace=True)
+        
+        def remove_quantization_modules(model):
+            for name, module in model.named_children():
+                if isinstance(module, (QuantStub, DeQuantStub)):
+                    setattr(model, name, torch.nn.Identity())  # 替換為空操作
+                else:
+                    remove_quantization_modules(module)
+
+        remove_quantization_modules(quantized_model)  
+        
+
+        # 保存量化模型
+        torch.save(quantized_model.state_dict(), "qat_model.pth")
+
+        # 加載檢查點
+        state_dict = torch.load("qat_model.pth")
+
+        # 解量化並過濾額外鍵值
+        for key, value in state_dict.items():
+            if isinstance(value, torch.Tensor) and value.is_quantized:
+                state_dict[key] = value.dequantize()
+
+        filtered_state_dict = {k: v for k, v in state_dict.items() if k in float_model.state_dict().keys()}
+
+        # 加載到未量化模型
+        float_model.load_state_dict(filtered_state_dict)
+        set_training(float_model,training=False)
+        move_model_to_device(float_model,'cpu')
+        cpu_input = test_input.cpu().permute(0,2,3,1)
+        with BytesIO() as f:
+            # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+            output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+            # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+            # output_names = ['scores','boxes']
+            torch.onnx.export(
+                float_model,
+                cpu_input,
+                f,
+                input_names=['images'],
+                output_names=output_names,
+                do_constant_folding=True,
+                opset_version=13)
+            f.seek(0)
+            onnx_model = onnx.load(f)
+            onnx.checker.check_model(onnx_model)
+            onnx_model, check = onnxsim.simplify(onnx_model)
+            onnx.save(onnx_model, "after_quan.onnx")
+        
+    del quantized_model
+    del onnx_model
+    move_model_to_device(float_model,device="cuda")
+    test_input = test_input.to("cuda")
+    return mtk_calibration_and_export_tflite2(runner=runner, model=float_model,text=text, test_input=test_input)
+
+def mtk_qat3(runner, model, text, test_input):
+    
+    import mtk_converter
+    
+    original_model = FQATDelopyModel(baseModel=model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    original_model.eval()
+
+    # 使用 deepcopy 複製模型
+    copy_model = copy.deepcopy(original_model)
+    quantized_model = QDelopyModel(baseModel=copy_model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    copy_model2 = copy.deepcopy(original_model)
+    float_model = FDelopyModel(baseModel=copy_model2.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    # 3. 設定量化配置 (QAT)
+    # qconfig_mapping = get_default_qat_qconfig("fbgemm")  # CPU-friendly量化配置
+    # quantized_model = prepare_qat_fx(quantized_model, qconfig_mapping, test_input)    
+    # modules_to_fuse = [ ['conv1', 'bn1', 'relu1'], ['submodule.conv', 'submodule.relu']]
+    # quantized_model = torch.ao.quantization.fuse_modules(quantized_model, modules_to_fuse)
+    # quantized_model.fuse_model(is_qat=True)
+    
+    # The old 'fbgemm' is still available but 'x86' is the recommended default.
+    set_training(quantized_model,training=True)
+    # replace_silu_recursive(quantized_model)
+    fuse_all_layers(quantized_model)
+    fuse_all_layers(float_model)
+    quantized_model.qconfig = torch.ao.quantization.get_default_qat_qconfig(target_backend)
+    
+    torch.ao.quantization.prepare_qat(quantized_model, inplace=True)
+    set_qat_qconfig_all_layers(quantized_model)
+    # quantized_model = mtk_quantization.pytorch.fuse_modules(quantized_model, test_input)
+    # quantized_model = mtk_quantization.pytorch.ConfigGenerator(model)
+    # quantize_handler = mtk_quantization.pytorch.QuantizeHandler()
+    # quantized_model = quantize_handler.prepare(quantized_model,'./work_dirs/quant_config.json')
+    
+    # 驗證所有層的 QConfig
+    print("\n[INFO] Model QConfig settings:")
+    # for name, module in quantized_model.named_modules():
+    #     if hasattr(module, 'qconfig') and module.qconfig:
+    #         print(f"{name}: {module.qconfig}")
+    # replace_silu_recursive(quantized_model)
+    # quantized_model.eval()
+    # quantized_model = fuse_modules_qat(quantized_model,[['conv','bn','activate'],['conv','bn']])
+    set_training(model=quantized_model,training=True)
+    # fuse_all_layers(quantized_model)
+    # replace_embedding_with_quantized(quantized_model)
+    # quantized_model.train()
+    
     
     # 模擬訓練
     optimizer = optim.Adam(quantized_model.parameters(), lr=1e-3)
@@ -333,112 +1037,140 @@ def mtk_qat(runner, model, text, test_input):
     def calibration_data_function():
         return iter(get_calibrattion_data(runner, text, num_samples=num_data))
     # 訓練迴圈
-    for i, input_tensor in enumerate(calibration_data_function()):
-        if isinstance(input_tensor, list):
-            input_tensor = input_tensor[0]
-        if isinstance(input_tensor, np.ndarray):
-            input_tensor = torch.from_numpy(input_tensor).to(test_input.device)
-        with torch.no_grad():
-            original_output = original_model(input_tensor)  # 原始模型輸出
+    for epoch in range(10):
+        with tqdm(calibration_data_function(), desc=f'QAT epoch-{epoch}:') as pbar:
+            for i, input_tensor in enumerate(pbar):
+                if isinstance(input_tensor, list):
+                    input_tensor = input_tensor[0]
+                if isinstance(input_tensor, np.ndarray):
+                    input_tensor = torch.from_numpy(input_tensor).to(test_input.device)
+                with torch.no_grad():
+                    original_output = original_model(input_tensor) #/255)  # 原始模型輸出
 
-        quantized_output = quantized_model(input_tensor)  # 量化模型輸出
+                quantized_output = quantized_model(input_tensor)#/255)  # 量化模型輸出
 
-        # 逐元素計算損失
-        for j in range(len(original_output)):
-            element_loss = mse_loss(quantized_output[j].float().to('cpu'), original_output[j].float().to('cpu'))  # 計算每個元素的 MSE
-            total_loss += element_loss  # 累加損失
-        if i%batch==(batch-1):
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-            print(f"Step {i + 1}, Loss: {total_loss.item()}")
-            total_loss=0
-        if i > 3 * num_data:
-            # Freeze quantizer parameters
-            quantized_model.apply(torch.ao.quantization.disable_observer)
-        if i > 2 * num_data:
-            # Freeze batch norm mean and variance estimates
-            quantized_model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
+                # 逐元素計算損失
+                for j in range(2):
+                    element_loss = mse_loss(quantized_output[j].float(), original_output[j].float())  # 計算每個元素的 MSE
+                    total_loss += element_loss  # 累加損失
+                if i%batch==(batch-1):
+                    total_loss = total_loss / batch
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
+                    # print(f"Step {i + 1}, Loss: {total_loss.item()}")
+                    # tqdm.write(f'Loss: {total_loss.item():.4f}')
+                    pbar.set_postfix(loss=total_loss.item()) 
+                    total_loss=0
+            if epoch > 3:
+                # Freeze quantizer parameters
+                quantized_model.apply(torch.ao.quantization.disable_observer)
+            if epoch > 2:
+                # Freeze batch norm mean and variance estimates
+                quantized_model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
     
-    # 7. 將 QAT 模型轉換為量化模型
-    # quantized_model.eval()
-    # quantized_model = convert_fx(quantized_model)
-    # Check the accuracy after each epoch
-    quantized_model=quantized_model.eval()
-    # fuse_all_layers(quantized_model)
-    quantized_model = torch.ao.quantization.convert(quantized_model, inplace=True)
-    scripted_model = torch.jit.trace(quantized_model.cpu(),test_input.cpu())
-    # custom_convert(quantized_model)
-    with BytesIO() as f:
-        # output_names = ['num_dets', 'boxes', 'scores', 'labels']
-        # output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        # output_names = ['scores','boxes']
-        torch.onnx.export(
-            quantized_model.cpu(),
-            test_input.cpu(),
-            f,
-            input_names=['images'],
-            output_names=output_names,
-            do_constant_folding=True,
-            opset_version=13)
-        f.seek(0)
-        onnx_model = onnx.load(f)
-        onnx.checker.check_model(onnx_model)
-        onnx_model, check = onnxsim.simplify(onnx_model)
-        onnx.save(onnx_model, "after_quan.onnx")
-    # 1. 保存量化後模型為 TorchScript
-    # scripted_model = torch.jit.script(quantized_model)
-    device = torch.device("cuda")
-    def move_model_to_cpu(model):
-        # 將所有參數和緩衝區移動到 CPU
-        for param in model.parameters():
-            param.data = param.data.to(device)
-            if param.grad is not None:
-                param.grad.data = param.grad.data.to(device)
-
-        for buffer in model.buffers():
-            buffer.data = buffer.data.to(device)
-
-        # 遞歸處理所有子模塊
-        for submodule in model.children():
-            move_model_to_cpu(submodule)
-    move_model_to_cpu(quantized_model)
-    quantized_model = quantized_model.to(device)
-    scripted_model= torch.jit.trace(quantized_model, test_input.to(device))
-    scripted_model.save("scripted_model.pt")
-    print("Quantized model saved as TorchScript (quantized_model.pt)")
-    mtk_converter.PyTorchV2Converter.from_exported_program(scripted_model,input_shapes=[(1,640,640,3)])
-    
-    # 8. 測試量化後的模型
+    set_training(quantized_model,training=False)
+    move_model_to_device(quantized_model,'cpu')
     with torch.no_grad():
-        # test_input = torch.randn(1, 3, 8, 8)
-        output = quantized_model(test_input)
-        print("Quantized Model Output:", output)
+        torch.jit.save(torch.jit.trace(quantized_model.cpu().eval(), torch.randn(1,640,640,3)), './work_dirs/qat_trace_model.pt')
+        
+        def replace_identity(module):
+            if 'ConvModule' in str(type(module)):
+                if hasattr(module, "bn") and 'Identity' in str(type(module.bn)):
+                    module.with_norm = False
+                    module.bn = nn.Identity()                
+                if hasattr(module, "norm") and 'Identity' in str(type(module.norm)):
+                    module.with_norm = False
+                    module.norm = nn.Identity()
+                if hasattr(module, "activate") and 'Identity' in str(type(module.activate)):
+                    module.with_activation = False
+                    module.activation = nn.Identity()
+                if hasattr(module, "act") and 'Identity' in str(type(module.activate)):
+                    module.with_activation = False
+                    module.activation = nn.Identity()
+            elif 'TopK' in str(type(module)):
+                print(module)
+            # elif isinstance(module, (torch.nn.quantized.Quantize, torch.nn.quantized.DeQuantize)):
+            #     module = torch.nn.Identity()
+                    
+            for name, child in module.named_children():
+                print(f'name = {name}, child = {type(child)}')
+                if isinstance(child, torch.nn.modules.linear.Identity):
+                    # setattr(module, name, nn.Sequential())  # 替換為 nn.Sequential
+                    if 'bn' in name:
+                        setattr(module,"with_norm", False)
+                    elif 'norm' in name:
+                        setattr(module, "with_norm", False)
+                    elif 'activate' in name:
+                        setattr(module, "with_activation", False)
+                    elif 'act' in name:
+                        setattr(module, "with_activation", False)
+                else:
+                    replace_identity(child)
 
-    # 9. 保存量化後模型為 TorchScript
-    scripted_model = torch.jit.script(quantized_model)
-    scripted_model.save("quantized_model.pt")
-    print("Quantized model saved as TorchScript (quantized_model.pt)")
+        
+        quantized_model = torch.ao.quantization.convert(quantized_model, inplace=True)
+        torch.jit.save(torch.jit.script(quantized_model.cpu().eval(), torch.randn(1,640,640,3)), './work_dirs/qat_script_model.pt')
+        
+        def remove_quantization_modules(model):
+            for name, module in model.named_children():
+                if isinstance(module, (QuantStub, DeQuantStub)):
+                    setattr(model, name, torch.nn.Identity())  # 替換為空操作
+                else:
+                    remove_quantization_modules(module)
+
+        remove_quantization_modules(quantized_model)  
+        
+
+        # 保存量化模型
+        torch.save(quantized_model.state_dict(), "qat_model.pth")
+
+        # 加載檢查點
+        state_dict = torch.load("qat_model.pth")
+
+        # 解量化並過濾額外鍵值
+        for key, value in state_dict.items():
+            if isinstance(value, torch.Tensor) and value.is_quantized:
+                state_dict[key] = value.dequantize()
+
+        filtered_state_dict = {k: v for k, v in state_dict.items() if k in float_model.state_dict().keys()}
+
+        # 加載到未量化模型
+        float_model.load_state_dict(filtered_state_dict)
+        set_training(float_model,training=False)
+        move_model_to_device(float_model,'cpu')
+        cpu_input = test_input.cpu().permute(0,2,3,1)
+        with BytesIO() as f:
+            # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+            output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+            # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+            # output_names = ['scores','boxes']
+            torch.onnx.export(
+                float_model,
+                cpu_input,
+                f,
+                input_names=['images'],
+                output_names=output_names,
+                do_constant_folding=True,
+                opset_version=13)
+            f.seek(0)
+            onnx_model = onnx.load(f)
+            onnx.checker.check_model(onnx_model)
+            onnx_model, check = onnxsim.simplify(onnx_model)
+            onnx.save(onnx_model, "after_quan.onnx")
+        
+    del quantized_model
+    del onnx_model
+    move_model_to_device(float_model,device="cuda")
+    test_input = test_input.to("cuda")
+    return mtk_calibration_and_export_tflite2(runner=runner, model=float_model,text=text, test_input=test_input)
     
-    with BytesIO() as f:
-        # output_names = ['num_dets', 'boxes', 'scores', 'labels']
-        # output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        # output_names = ['scores','boxes']
-        torch.onnx.export(
-            scripted_model,
-            test_input,
-            f,
-            input_names=['images'],
-            output_names=output_names,
-            do_constant_folding=True,
-            opset_version=13)
-        f.seek(0)
-        onnx_model = onnx.load(f)
-        onnx.checker.check_model(onnx_model)
-        onnx_model, check = onnxsim.simplify(onnx_model)
-        onnx.save(onnx_model, "after_quan.onnx")
+def mtk_convert_from_onnx(runner, model_file,text, test_input):
+    import mtk_converter
+    
+    onnx_model = onnx.load(model_file)
+    onnx_model, check = onnxsim.simplify(onnx_model)
+    onnx.save(onnx_model, "after_quan.onnx")
     #################
     graph = onnx_model.graph
 
@@ -506,161 +1238,85 @@ def mtk_qat(runner, model, text, test_input):
                 #     # value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
                 #     value_info.type.tensor_type.elem_type = TensorProto.UINT8  # 设置数据类型
                     # print(f"After modification: {value_info}")
-    # 保存模型
-    modified_filename = "modified_model.onnx"
-    onnx.save(onnx_model, modified_filename) 
-    print("Model saved as modified_model.onnx")
-    print("Model exported to ONNX.")
     converter = mtk_converter.OnnxConverter.from_model_proto(onnx_model, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=['topk_scores', 'topk_classes','topk_indices','topk_bboxes'])
     converter.quantize = True
     converter.input_value_ranges = [(0, 255)]
     converter.use_unsigned_quantization_type=True
     converter.use_hessian_opt = True
+    # data_reader = DataReader(generator=get_calibrattion_data(runner=runner, text=text))
     
-def mtk_torchao(runner, model, text, test_input):
-    from torchao.quantization.qat import Int8DynActInt4WeightQATQuantizer    
-    qat_quantizer = Int32DynActInt4WeightQATQuantizer()
-    original_model = model
-    original_model.eval()
-
-    # 使用 deepcopy 複製模型
-    quantized_model = copy.deepcopy(original_model)
-    quantized_model = qat_quantizer.prepare(quantized_model)
-    quantized_model.to(test_input.device).train()
-    # 模擬訓練
-    optimizer = optim.Adam(quantized_model.parameters(), lr=1e-3)
-    mse_loss = nn.MSELoss()
-    num_data = 10
+    def data_gen():
+        for i in range(100):
+            yield [np.random.randn(1,640,640,3).astype(np.float32)] 
+    # # calibr_data = lambda: iter(data_reader)
+    # converter._calibration_data_gen = lambda: iter(data_reader)
+    num_data =200
+    # data_reader = DataReader(generator=get_calibrattion_data(runner, text, num_samples=num_data), data_length=num_data)
+    # 確保 DataReader 運行正常
+    # for idx, sample in enumerate(iter(data_reader)):
+    #     if idx >= 10:
+    #         break
+    #     print(f"Read sample {idx}: {sample}")
+    # generator=get_calibrattion_data(runner, text, num_samples=num_data)
+    # 包裝 calibration data 為函數
+    # num_data = 5000
     def calibration_data_function():
         return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+
+    # 正確設置 calibration_data_gen
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = './work_dirs/quantized_model.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
+    # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+    # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+    output_file = './work_dirs/quantized_model.dla'
+    # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+    import subprocess
+
+    # 設置環境變量
+    env = {
+        "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+    }
+
+    # 命令拆分為列表
+    cmd = [
+        "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+        "--arch=mdla5.1,mvpu2.5",
+        "-O3",
+        "--show-exec-plan",
+        f"{tflite_file}",
+        "-o",
+        f"{output_file}",
+    ]
+
+    # 使用 subprocess 執行命令
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+
+
+    # 打印執行結果
+    print("STDOUT:", result.stdout)
+    print("STDERR:", result.stderr)
+    print("Return Code:", result.returncode)
     
-    total_loss=0
-    batch = 4
-    # 訓練迴圈
-    for i, input_tensor in enumerate(calibration_data_function()):
-        if isinstance(input_tensor, list):
-            input_tensor = input_tensor[0]
-        if isinstance(input_tensor, np.ndarray):
-            input_tensor = torch.from_numpy(input_tensor).to(test_input.device)
-        with torch.no_grad():
-            original_output = original_model(input_tensor)  # 原始模型輸出
-
-        quantized_output = quantized_model(input_tensor)  # 量化模型輸出
-
-        # 逐元素計算損失
-        for j in range(len(original_output)):
-            element_loss = mse_loss(quantized_output[j].float().to('cpu'), original_output[j].float().to('cpu'))  # 計算每個元素的 MSE
-            total_loss += element_loss  # 累加損失
-        if i%batch==(batch-1):
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-            print(f"Step {i + 1}, Loss: {total_loss.item()}")
-            total_loss=0
-    model = qat_quantizer.convert(quantized_model)
-    print(model)    
-                     
-    
-def mtk_QAT_and_export_tflite(runner, model, text, test_input):
-    # 準備模型
-    
-    
-    original_model = model
-    original_model.eval()
-
-
-    # 使用 deepcopy 複製模型
-    quantized_model = copy.deepcopy(original_model)
-    quantized_model.to(test_input.device).train()
-    quantized_model.to('cpu')  # 模型轉移到 CPU
-    # torch.backends.quantized.engine = 'x86' # 'fbgemm'
-
-    replace_activation(quantized_model, torch.nn.SiLU, SiLUApprox)
-    replace_activation(quantized_model, torch.nn.Sigmoid, nnq.Sigmoid)
-    set_qat_qconfig_all_layers(quantized_model)
-    # 驗證所有層的 QConfig
-    print("\n[INFO] Model QConfig settings:")
-    for name, module in quantized_model.named_modules():
-        if hasattr(module, 'qconfig') and module.qconfig:
-            print(f"{name}: {module.qconfig}")
-    replace_embedding_with_quantized(quantized_model)
-    quantized_model  = quantization.prepare_qat(quantized_model, inplace=True)
-    # 模擬訓練
-    optimizer = optim.Adam(quantized_model.parameters(), lr=1e-3)
-    mse_loss = nn.MSELoss()
-    num_data = 10
-    def calibration_data_function():
-        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
-    
-    total_loss=0
-    batch = 4
-    # 訓練迴圈
-    for i, input_tensor in enumerate(calibration_data_function()):
-        if isinstance(input_tensor, list):
-            input_tensor = input_tensor[0]
-        if isinstance(input_tensor, np.ndarray):
-            input_tensor = torch.from_numpy(input_tensor).to(test_input.device)
-        with torch.no_grad():
-            original_output = original_model(input_tensor)  # 原始模型輸出
-
-        quantized_output = quantized_model(input_tensor.to('cpu'))  # 量化模型輸出
-
-        # 逐元素計算損失
-        for j in range(len(original_output)):
-            element_loss = mse_loss(quantized_output[j].float().to('cpu'), original_output[j].float().to('cpu'))  # 計算每個元素的 MSE
-            total_loss += element_loss  # 累加損失
-        if i%batch==(batch-1):
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
-            print(f"Step {i + 1}, Loss: {total_loss.item()}")
-            total_loss=0
-
-
-    # 轉換量化模型為最終格式
-    quantized_model.eval()
-    quantized_model = quantization.convert(quantized_model, inplace=True).to('cpu')
-    # float_model = torch.quantization.convert(quantized_model, remove_qconfig=True)
-    # 儲存量化後的模型
-    torch.save(quantized_model, 'quantized_model.pth')
-    with BytesIO() as f:
-        # output_names = ['num_dets', 'boxes', 'scores', 'labels']
-        # output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        # output_names = ['scores','boxes']
-        torch.onnx.export(
-            quantized_model,
-            test_input.to('cpu'),
-            f,
-            input_names=['images'],
-            output_names=output_names,
-            opset_version=13)
-        f.seek(0)
-        onnx_model = onnx.load(f)
-        onnx.checker.check_model(onnx_model)
-        onnx_model, check = onnxsim.simplify(onnx_model)
-        onnx.save(onnx_model, "quantized_model.onnx")
-    # 驗證輸出
-    
-    # original_output = original_model(test_input)
-    # quantized_output = quantized_model(test_input.to('cpu'))
-
-    # print("輸出誤差:", torch.norm(original_output[0].cpu() - quantized_output[0].cpu()).item())
-
-    
+    del converter
+    del onnx_model
+    return (result,output_file, tflite_file)
     
 def mtk_calibration_and_export_tflite(runner, model, text, test_input):
     import mtk_quantization
     import mtk_converter
     
+    # fmodel = FDelopyModel(baseModel=model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    # example_input = 
     with BytesIO() as f:
         # output_names = ['num_dets', 'boxes', 'scores', 'labels']
-        # output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-        output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
         # output_names = ['scores','boxes']
         torch.onnx.export(
-            model,
-            test_input,
+            model.cpu(),
+            test_input.cpu(),
             f,
             input_names=['images'],
             output_names=output_names,
@@ -806,100 +1462,556 @@ def mtk_calibration_and_export_tflite(runner, model, text, test_input):
     del onnx_model
     del converter
     return (result,output_file, tflite_file)
-    
-    
-    
-    
-    
-    
-    
-    
-    # from torch.quantization import prepare, convert
-    # from torch.ao.quantization import quantize, get_default_qconfig
 
     
-    # # 模型準備
-    # model.eval()  # 進入評估模式
-    # # 設置後端為 qnnpack
-    # torch.backends.quantized.engine = 'fbgemm'
-
-    # # 配置量化參數
-    # # quantization_config = torch.quantization.get_default_qconfig('qnnpack')
-    # quantization_config = get_default_qconfig('fbgemm')
+def mtk_calibration_and_export_tflite2(runner, model, text, test_input):
+    import mtk_quantization
+    import mtk_converter
     
-    # model.qconfig = quantization_config
-    # model.baseModel.qconfig = quantization_config
-    # model.baseModel.backbone.qconfig = quantization_config
-    # model.baseModel.neck.qconfig = quantization_config
-    # model.baseModel.bbox_head.qconfig = quantization_config
+    fmodel = FDelopyModel(baseModel=model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
+    move_model_to_device(fmodel,"cpu")
+    cpu_input = test_input.cpu().permute(0,2,3,1)
+    # example_input = 
+    with BytesIO() as f:
+        # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+        output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        # output_names = ['scores','boxes']
+        torch.onnx.export(
+            fmodel,
+            cpu_input,
+            f,
+            input_names=['images'],
+            output_names=output_names,
+            do_constant_folding=True,
+            opset_version=13)
+        f.seek(0)
+        onnx_model = onnx.load(f)
+        onnx.checker.check_model(onnx_model)
+        onnx_model, check = onnxsim.simplify(onnx_model)
+        onnx.save(onnx_model, "fmodel.onnx")
+    #################
+    graph = onnx_model.graph
 
-    # # 遍歷所有子模塊，禁用名稱中包含 "text" 的模塊的量化
-    # for name, module in model.named_modules():
-    #     if 'text' in name or 'data_preprocessor' in name:  # 判斷條件
-    #         module.qconfig = None  # 禁用量化
-    #         print(f"Disabled quantization for module: {name}")
-    #     else:
-    #         module.qconfig = quantization_config
-    #         print(f"enable quantization for module: {name}")
-    # data_preprocessor = model.baseModel.data_preprocessor
-    # model.baseModel.data_preprocessor = None
+    # 修改輸出名稱
+    for output in graph.output:
+        print(output.name)
+    # 遍历节点，找到 TopK 操作
+    for node in graph.node:
+        if node.op_type == "TopK":
+            print(f"Found TopK Node: {node.name}")
+            
+            # 确定 TopK 的第二个输入（k 值）的名字
+            k_input_name = node.input[1]
+            print(f"K input name: {k_input_name}")
+            
+            indices_output_name = node.output[1]
+            print(f"Indices output name: {indices_output_name}")
+            # 遍历初始化器，找到对应的 k
+            for initializer in graph.initializer:
+                if initializer.name == k_input_name:
+                    print(f"Found initializer for K: {initializer.name}")
+                    
+                    # 转换为 NumPy 数组
+                    k_array = to_array(initializer)
+                    
+                    # 检查 k 是否是形状为 [1] 的张量
+                    if k_array.shape == (1,):
+                        print(f"Original K value: {k_array}")
+
+                        # 修改为形状为 [] 的标量
+                        k_scalar = k_array.item()  # 提取标量值
+                        new_initializer = from_array(
+                            np.array(k_scalar, dtype=k_array.dtype).reshape(()),
+                            name=initializer.name
+                        )                        
+                        # 替换原来的初始化器
+                        graph.initializer.remove(initializer)
+                        graph.initializer.append(new_initializer)
+                        print(f"Modified K to scalar: {k_scalar}")
+                # elif initializer.name == indices_output_name:
+                #     nitializer_found = True
+                #     print(f"Modifying initializer {initializer.name}")
+                    
+                #     # 提取數據並轉換為 uint8
+                #     original_data = to_array(initializer)
+                #     converted_data = original_data.astype(np.uint8)
+                    
+                #     # 創建新的初始化器
+                #     new_initializer = from_array(
+                #         converted_data, name=initializer.name)
+                    
+                #     # 替換舊的初始化器
+                #     graph.initializer.remove(initializer)
+                #     graph.initializer.append(new_initializer)
+                    
+            # 修改形状信息
+            for value_info in graph.value_info:
+                if value_info.name == k_input_name:
+                    print(f"Before modification: {value_info}")
+                    value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+                    value_info.type.tensor_type.elem_type = TensorProto.INT64  # 设置数据类型
+                    print(f"After modification: {value_info}")
+                # elif value_info.name == indices_output_name:
+                #     print(f"Before modification: {value_info}")
+                #     # value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+                #     value_info.type.tensor_type.elem_type = TensorProto.UINT8  # 设置数据类型
+                    # print(f"After modification: {value_info}")
+    # 保存模型
+    modified_filename = "modified_fmodel.onnx"
+    onnx.save(onnx_model, modified_filename) 
+    print("Model saved as modified_model.onnx")
+    print("Model exported to ONNX.")
+    converter = mtk_converter.OnnxConverter.from_model_proto(onnx_model, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=['topk_scores', 'topk_classes','topk_indices','topk_bboxes'])
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    
+    converter.precision_config_file = 'precision_config8W16A.json'
+    # converter.use_hessian_opt = True
+    # converter.precision_proportion = {'8W16A':1.0}
+    converter.use_unsigned_quantization_type=True
     # data_reader = DataReader(generator=get_calibrattion_data(runner=runner, text=text))
     
+    def data_gen():
+        for i in range(100):
+            yield [np.random.randn(1,640,640,3).astype(np.float32)] 
     # # calibr_data = lambda: iter(data_reader)
-    # quantized_model = quantize(
-    #     model.to('cpu'),
-    #     run_fn=lambda m: m(torch.randn(1, 3, 640, 640).to('cpu')),  # 校準函數
-    #     run_args=()
-    #     )
-    # model.to(device=test_input.device)
-    # with BytesIO() as f:
-    #     # output_names = ['num_dets', 'boxes', 'scores', 'labels']
-    #     output_names = ['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes']
-    #     # output_names = ['scores','boxes']
-    #     torch.onnx.export(
-    #         quantized_model,
-    #         test_input.cpu(),
-    #         f,
-    #         input_names=['images'],
-    #         output_names=output_names,
-    #         opset_version=13)
-    #     f.seek(0)
-    #     onnx_model = onnx.load(f)
-    #     onnx.checker.check_model(onnx_model)
-    #     onnx_model, check = onnxsim.simplify(onnx_model)
-    #     onnx.save(onnx_model, "after_quan.onnx")
-    # print("Model exported to ONNX.")
-    # # 準備模型進行量化
-    # # model_prepared = prepare(model)
+    # converter._calibration_data_gen = lambda: iter(data_reader)
+    num_data =10
+    # data_reader = DataReader(generator=get_calibrattion_data(runner, text, num_samples=num_data), data_length=num_data)
+    # 確保 DataReader 運行正常
+    # for idx, sample in enumerate(iter(data_reader)):
+    #     if idx >= 10:
+    #         break
+    #     print(f"Read sample {idx}: {sample}")
+    # generator=get_calibrattion_data(runner, text, num_samples=num_data)
+    # 包裝 calibration data 為函數
+    # num_data = 5000
+    def calibration_data_function():
+        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+
+    # 正確設置 calibration_data_gen
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = './work_dirs/quantized_model.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
+    do_dla = True
+    if do_dla:
+        # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+        # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+        output_file = './work_dirs/quantized_model.dla'
+        # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+        import subprocess
+
+        # 設置環境變量
+        env = {
+            "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+        }
+
+        # 命令拆分為列表
+        cmd = [
+            "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+            "--arch=mdla5.1,mvpu2.5",
+            "-O3",
+            "--show-exec-plan",
+            f"{tflite_file}",
+            "-o",
+            f"{output_file}",
+        ]
+
+        # 使用 subprocess 執行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # 打印執行結果
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        print("Return Code:", result.returncode)
+    else:
+        result = None
     
-    # # quan_model = mtk_quantization.pytorch.fuse_modules(model_prepared,test_input)
-    # # # 模型融合：將 Conv-BN-ReLU 融合為一個操作
+    del onnx_model
+    del converter
+    return (result,output_file, tflite_file)    
+
+def compare_float_and_tflite(runner, model, text, test_input, model_dir=None):
+    import onnxruntime as ort
+    import mtk_converter
+    # model_dir = '/storage/SSD_4T/yptsai/program/object_detection/stevengrove/work_dirs/8W8A/'
+    # model_dir = '/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/16W16A/'
+    if model_dir is None:
+        model_dir = '/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A_MIX/'
+        
+    model = FDelopyModel2(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    set_training(model,training=False)
     
-    # # config_generator = mtk_quantization.pytorch.ConfigGenerator(quan_model)
-    # # config_generator.export_config('./work_dirs/quant_config.json', example_inputs=test_input)
-    # # quan_model.eval()
-    # # correct=0
-    # # data_reader = DataReader(generator=get_calibrattion_data(runner=runner, text=text))
+    onnx_model_path = os.path.join(model_dir, "modified_fmodel.onnx")
+    onnx_model = onnx.load(onnx_model_path)
+    
+    # 验证模型的结构是否有效
+    onnx.checker.check_model(onnx_model)
+    print("ONNX model is valid.")
+    
+    class InferenceSessionContext:
+        def __init__(self, model_path):
+            self.model_path = model_path
+            self.session = None
+
+        def __enter__(self):
+            self.session = ort.InferenceSession(self.model_path)
+            return self.session
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del self.session
+            gc.collect()
+    
+    # session = ort.InferenceSession(onnx_model_path)
+            
+    # 初始化 ONNX Runtime 的推理会话
+    with InferenceSessionContext(onnx_model_path) as session:
+        
+
+        # 打印模型输入和输出信息
+        print("Model Inputs:")
+        for input_meta in session.get_inputs():
+            print(f"Name: {input_meta.name}, Shape: {input_meta.shape}, Type: {input_meta.type}")
+
+        print("Model Outputs:")
+        for output_meta in session.get_outputs():
+            print(f"Name: {output_meta.name}, Shape: {output_meta.shape}, Type: {output_meta.type}")
+
+        # 准备输入数据（根据模型的输入形状生成随机数据作为示例）
+        input_name = session.get_inputs()[0].name
+        input_shape = session.get_inputs()[0].shape
+        input_data = np.transpose(test_input.cpu().numpy().astype(np.float32), (0,2,3,1))
+        
+        # 执行推理
+        output_name = [o.name for o in session.get_outputs()]
+        onnx_output = session.run(output_name, {input_name: input_data})
+
+    del onnx_model
+    gc.collect()
+    # 打印结果
+    print("Inference Result:", onnx_output)
+    
+    # tflite_file = model_dir + "quantized_model.tflite"
+    # tflite_editor = mtk_converter.TFLiteEditor(tflite_file)
+    # tflite_editor.toggle_signed_or_unsigned_data_types(['images', 'images_padded_out'])    
+    # tflite_file=model_dir + 'quantized_model_unsigned.tflite'
+    # tflite_editor.export(tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+    # 加載 TFLite 模型
+    tflite_model_path = os.path.join(model_dir, "quantized_model_unsigned.tflite")
+    # interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    # interpreter.allocate_tensors()
+    interpreter = mtk_converter.TFLiteExecutor(tflite_model_path)
+    input_data_uint8 = (input_data * 255).astype(np.uint8)
+    
+    tflite_output = interpreter.run([input_data_uint8], output_name )
+    
+    
+    
+    # 獲取輸入和輸出張量
+    # input_details = interpreter.get_input_details()
+    # output_details = interpreter.get_output_details()
+    
+    # 準備輸入數據
+    # uint8_input_data = (input_data * 255).astype(np.uint8)
+    # interpreter.set_tensor(input_details[0]['index'], uint8_input_data)
+    
+    # 執行推理
+    # interpreter.invoke()
+    
+    # 獲取輸出
+    # tflite_output = interpreter.get_tensor(output_details[0]['index'])
+    
+    # 打印結果
+    print("TFLite Inference Result:", tflite_output)
+    
+    # run pytorch model
+    pytorch_output = model(test_input.permute(0,2,3,1))
+    pytorch_output = [o.cpu().detach().numpy() for o in pytorch_output][:2]
+    print("Pytorch Inference Result:", pytorch_output)
+    
+    # print top 10 error values
+    print("Pytorch vs ONNX:")
+    print(np.max(np.abs([p-o for p,o in zip(pytorch_output[0],onnx_output[0])])))
+    print(np.max(np.abs([p-o for p,o in zip(pytorch_output[1],onnx_output[1])])))
+    print("Pytorch vs TFLite:")
+    print(np.max(np.abs([p-t for p,t in zip(pytorch_output[0],tflite_output[0])])))
+    print(np.max(np.abs([p-t for p,t in zip(pytorch_output[1],tflite_output[1])])))
+    
+    
+    # 比較結果
+    # np.testing.assert_allclose(pytorch_output, onnx_output, rtol=1e-3, atol=1e-3)
+    # np.testing.assert_allclose(pytorch_output, tflite_output, rtol=1e-3, atol=1e-3)
+    
+    print("All results are similar.")
+    
+    
+    
+    
+    
+    
+    
+    
+
+    
+    
+    
+def mtk_calibration_and_export_tflite3(runner, model, text, test_input):
+    import mtk_quantization
+    import mtk_converter
+    
+    fmodel = FDelopyModel2(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    set_training(fmodel, False)
+    # move_model_to_device(fmodel,"cpu")
+    # cpu_input = test_input.cpu().permute(0,2,3,1)
+    cpu_input = test_input.permute(0,2,3,1)
+    combine = '8W8A0.4_8W16A0.3_16W16A0.3'
+    work_dir = f'./work_dirs/{combine}/'
+    os.makedirs(work_dir, exist_ok=True)
+    # example_input = 
+    with BytesIO() as f:
+        # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+        # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        output_names = ['scores','boxes']
+        torch.onnx.export(
+            fmodel,
+            cpu_input,
+            f,
+            input_names=['images'],
+            output_names=output_names,
+            do_constant_folding=True,
+            opset_version=13)
+        f.seek(0)
+        onnx_model = onnx.load(f)
+        onnx.checker.check_model(onnx_model)
+        onnx_model, check = onnxsim.simplify(onnx_model)
+        onnx.save(onnx_model, f"{work_dir}/fmodel.onnx")
+    #################
+    graph = onnx_model.graph
+
+    # 修改輸出名稱
+    for output in graph.output:
+        print(output.name)
+    # 遍历节点，找到 TopK 操作
+    for node in graph.node:
+        if node.op_type == "TopK":
+            print(f"Found TopK Node: {node.name}")
+            
+            # 确定 TopK 的第二个输入（k 值）的名字
+            k_input_name = node.input[1]
+            print(f"K input name: {k_input_name}")
+            
+            indices_output_name = node.output[1]
+            print(f"Indices output name: {indices_output_name}")
+            # 遍历初始化器，找到对应的 k
+            for initializer in graph.initializer:
+                if initializer.name == k_input_name:
+                    print(f"Found initializer for K: {initializer.name}")
+                    
+                    # 转换为 NumPy 数组
+                    k_array = to_array(initializer)
+                    
+                    # 检查 k 是否是形状为 [1] 的张量
+                    if k_array.shape == (1,):
+                        print(f"Original K value: {k_array}")
+
+                        # 修改为形状为 [] 的标量
+                        k_scalar = k_array.item()  # 提取标量值
+                        new_initializer = from_array(
+                            np.array(k_scalar, dtype=k_array.dtype).reshape(()),
+                            name=initializer.name
+                        )                        
+                        # 替换原来的初始化器
+                        graph.initializer.remove(initializer)
+                        graph.initializer.append(new_initializer)
+                        print(f"Modified K to scalar: {k_scalar}")
+                # elif initializer.name == indices_output_name:
+                #     nitializer_found = True
+                #     print(f"Modifying initializer {initializer.name}")
+                    
+                #     # 提取數據並轉換為 uint8
+                #     original_data = to_array(initializer)
+                #     converted_data = original_data.astype(np.uint8)
+                    
+                #     # 創建新的初始化器
+                #     new_initializer = from_array(
+                #         converted_data, name=initializer.name)
+                    
+                #     # 替換舊的初始化器
+                #     graph.initializer.remove(initializer)
+                #     graph.initializer.append(new_initializer)
+                    
+            # 修改形状信息
+            for value_info in graph.value_info:
+                if value_info.name == k_input_name:
+                    print(f"Before modification: {value_info}")
+                    value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+                    value_info.type.tensor_type.elem_type = TensorProto.INT64  # 设置数据类型
+                    print(f"After modification: {value_info}")
+                # elif value_info.name == indices_output_name:
+                #     print(f"Before modification: {value_info}")
+                #     # value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+                #     value_info.type.tensor_type.elem_type = TensorProto.UINT8  # 设置数据类型
+                    # print(f"After modification: {value_info}")
+    # 保存模型
+    modified_filename = f"{work_dir}/modified_fmodel.onnx"
+    onnx.save(onnx_model, modified_filename) 
+    print("Model saved as modified_model.onnx")
+    print("Model exported to ONNX.")
+    converter = mtk_converter.OnnxConverter.from_model_proto_file(modified_filename, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=output_names)
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    json_file = f'{work_dir}/precision_config{combine}.json'
+    converter.precision_config_file = json_file
+    # converter.use_hessian_opt = True
+    # converter.precision_proportion = {'16W16A':1.0}
+    # converter.precision_proportion = {'16W16A':1.0}
+    # converter.precision_proportion = {'8W16A':1.0}
+    # converter.precision_proportion = {'8W8A':1.0}
+    # converter.precision_proportion = {'8W8A':0.5, '16W16A':0.5}
+    converter.precision_proportion = {'8W8A':0.4, '8W16A':0.3, '16W16A':0.3}
+    converter.use_unsigned_quantization_type=True
+    # data_reader = DataReader(generator=get_calibrattion_data(runner=runner, text=text))
+    
+    def data_gen():
+        for i in range(100):
+            yield [np.random.randn(1,640,640,3).astype(np.float32)] 
     # # calibr_data = lambda: iter(data_reader)
-    # # for data in calibr_data:
-    # #     quan_model(data)
-    # # # 轉換為量化模型
-    # # model_quantized = convert(model_prepared)
+    # converter._calibration_data_gen = lambda: iter(data_reader)
+    num_data =10
+    # data_reader = DataReader(generator=get_calibrattion_data(runner, text, num_samples=num_data), data_length=num_data)
+    # 確保 DataReader 運行正常
+    # for idx, sample in enumerate(iter(data_reader)):
+    #     if idx >= 10:
+    #         break
+    #     print(f"Read sample {idx}: {sample}")
+    # generator=get_calibrattion_data(runner, text, num_samples=num_data)
+    # 包裝 calibration data 為函數
+    # num_data = 5000
+    def calibration_data_function():
+        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+
+    # 正確設置 calibration_data_gen
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = f'{work_dir}/quantized_model.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
     
+    # 修改 tflite 模型的數據類型
+    with open(json_file, 'r') as file:
+        data = json.load(file)
+
+    # 遍歷 JSON 資料並檢查條件
+    for precision in data.get("precision_specs", []):
+        if precision.get("precision_name") == "8W8A":
+            # 檢查 "wgt_names" 中是否有包含 "split" 的字串
+            if any("split" in name for name in precision.get("wgt_names", [])):
+                # 修改 "precision_name" 為 "16W16A"
+                precision["precision_name"] = "16W16A"
+
+    # 遍歷 JSON 資料並檢查條件
+    for precision in data.get("precision_specs", []):
+        if precision.get("precision_name") == "16W16A":
+            # 檢查 "wgt_names" 中是否有包含 "split" 的字串
+            if any("images" in name for name in precision.get("param_names", [])):
+                # 修改 "precision_name" 為 "16W16A"
+                precision["precision_name"] = "8W8A"
+                
+    # 將修改後的 JSON 資料儲存到新檔案
+    with open(json_file, 'w') as file:
+        json.dump(data, file, indent=4)
     
-    # qat_model_file = "./work_dirs/qat_model.pt"
-    # tflite_file = "./work_dirs/qat_model.tflite"
-    # test_input_cpu = test_input.cpu()
-    # # scripted_model = torch.jit.script(quantized_model.cpu().eval())
-    # # torch.jit.save(scripted_model, qat_model_file)
-    # # print("Model successfully scripted and saved!")
+    converter = mtk_converter.OnnxConverter.from_model_proto_file(modified_filename, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=output_names)
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    converter.precision_config_file = json_file    
+    converter.use_unsigned_quantization_type=True
+    num_data =100
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = f'{work_dir}/quantized_model_modified.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
     
-    # torch.jit.save(torch.jit.trace(quantized_model.cpu().eval(), test_input_cpu), qat_model_file)
-    # print('finish calibration and output model {qat_model_file}')
-    # converter = mtk_converter.PyTorchConverter.from_script_module_file(qat_model_file, test_input_cpu)
-    # converter.quantize=True
-    # converter.input_value_ranges=[(0,1)]
-    # converter.convert_to_tflite(output_file=tflite_file)
+    do_dla = True
+    if do_dla:
+        # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+        # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+        output_file = f'{work_dir}/quantized_model.dla'
+        # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+        import subprocess
+
+        # 設置環境變量
+        env = {
+            "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+        }
+
+        # 命令拆分為列表
+        cmd = [
+            "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+            "--arch=mdla5.1,mvpu2.5",
+            "-O3",
+            "--show-exec-plan",
+            f"{tflite_file}",
+            "-o",
+            f"{output_file}",
+        ]
+
+        # 使用 subprocess 執行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # 打印執行結果
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        print("Return Code:", result.returncode)
+    else:
+        result = None
+    
+    tflite_editor = mtk_converter.TFLiteEditor(tflite_file)
+    tflite_editor.toggle_signed_or_unsigned_data_types(['images', 'images_padded_out'])
+    
+    tflite_file=f'{work_dir}/quantized_model_unsigned.tflite'
+    tflite_editor.export(tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+
+    do_dla = True
+    if do_dla:
+        # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+        # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+        output_file = f'{work_dir}/quantized_model_unsigned.dla'
+        # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+        import subprocess
+
+        # 設置環境變量
+        env = {
+            "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+        }
+
+        # 命令拆分為列表
+        cmd = [
+            "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+            "--arch=mdla5.1,mvpu2.5",
+            "-O3",
+            "--show-exec-plan",
+            f"{tflite_file}",
+            "-o",
+            f"{output_file}",
+        ]
+
+        # 使用 subprocess 執行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # 打印執行結果
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        print("Return Code:", result.returncode)
+    else:
+        result = None
+    del onnx_model
+    del converter
+    
+    compare_float_and_tflite(runner=runner, model=model, text=text, test_input=test_input, model_dir=work_dir)
+    
+    return (result,output_file, tflite_file)       
         
 def calibration_and_tflite(runner, model, text, fake_input):
     from onnx_tf.backend import prepare
@@ -1327,7 +2439,7 @@ def export_model(runner,
     # dry run
     image_path='./work_dirs/demo.png'
     fake_input = preprocess_with_cv2_only(image_path,convert_to_rgb=False).unsqueeze(0).to(dtype=torch.float32,device=device)
-    fake_input_cv2 = fake_input[:, [2, 1, 0], ...]/255.0
+    fake_input_cv2 = fake_input[:, [2, 1, 0], ...]#/255.0
     texts = [[t.strip()] for t in text.split(',')] + [[' ']]
     label_file = './work_dirs/label.txt'
     with open(label_file,"w") as fp:
@@ -1343,56 +2455,56 @@ def export_model(runner,
     fake_input_2 = runner.model.data_preprocessor(data_batch,False)
     torch.save(fake_input_2, "data_input_tensor.pt")
     # fake_input = fake_input_2['inputs'].permute(0,2,3,1)
-    fake_input = fake_input_pipeline[:1,[2,1,0],...].permute(0,2,3,1).to(dtype=torch.float32)
-    
-    results=deploy_model(fake_input)
+    # fake_input = fake_input_pipeline[:1,[2,1,0],...].permute(0,2,3,1).to(dtype=torch.float32)
+    fake_input = fake_input_2['inputs']
+    results=deploy_model(fake_input)#/255)
     
     batch_img_metas = [
             data_samples.metainfo for data_samples in [data_info['data_samples']]
         ]
     
-    tensor3 = fake_input_2['inputs'].cpu()
-    tensor4 = (fake_input_pipeline[:1,[2,1,0],...]/255.0).cpu()
-    # # 计算差异 (绝对值)
-    # difference = torch.abs(tensor1 - tensor2)
-    difference = torch.abs(tensor3 - tensor4)
-    # # 找到差异最大的 5 个值及其索引
-    top_k_values, top_k_indices = torch.topk(difference.flatten(), k=5)
+    # tensor3 = fake_input_2['inputs'].cpu()
+    # tensor4 = (fake_input_pipeline[:1,[2,1,0],...]).cpu() #/255.0).cpu()
+    # # # 计算差异 (绝对值)
+    # # difference = torch.abs(tensor1 - tensor2)
+    # difference = torch.abs(tensor3 - tensor4)
+    # # # 找到差异最大的 5 个值及其索引
+    # top_k_values, top_k_indices = torch.topk(difference.flatten(), k=5)
 
-    # # 转换为二维索引 (行, 列) 使用 numpy.unravel_index
-    top_k_indices_2d = np.unravel_index(top_k_indices.cpu().numpy(), difference.shape)
+    # # # 转换为二维索引 (行, 列) 使用 numpy.unravel_index
+    # top_k_indices_2d = np.unravel_index(top_k_indices.cpu().numpy(), difference.shape)
 
-    # # 打印差异最大的 5 个值及其位置
-    for i in range(5):
-        idx = tuple([ii[i] for ii in top_k_indices_2d])
-        # row, col = row, col = int(top_k_indices_2d[0][i]), int(top_k_indices_2d[1][i])
-        print(f"Difference: {top_k_values[i]} at position ({idx[-2]}, {idx[-1]})")
-        # print(f"Tensor1 Value: {tensor1[row, col]}, Tensor2 Value: {tensor2[row, col]}")
-        print(f"Tensor3 Value: {tensor3[idx]}, Tensor4 Value: {tensor4[idx]}")
+    # # # 打印差异最大的 5 个值及其位置
+    # for i in range(5):
+    #     idx = tuple([ii[i] for ii in top_k_indices_2d])
+    #     # row, col = row, col = int(top_k_indices_2d[0][i]), int(top_k_indices_2d[1][i])
+    #     print(f"Difference: {top_k_values[i]} at position ({idx[-2]}, {idx[-1]})")
+    #     # print(f"Tensor1 Value: {tensor1[row, col]}, Tensor2 Value: {tensor2[row, col]}")
+    #     print(f"Tensor3 Value: {tensor3[idx]}, Tensor4 Value: {tensor4[idx]}")
 
     # predict_head_predict_forword = torch.load("predict_head_predict_forword.pt")
     # runner_pred_by_feat = torch.load("predict_head_predict_by_feat.pt")
     # runner_before_deocde = torch.load("runner_before_deocde.pt")
     # predictions = runner.model.bbox_head.predict_by_feat([results[0][:1,:6,...],results[1][:1,:6,...],results[2][:1,:6,...]],[results[0][:1,6:,...],results[1][:1,6:,...],results[2][:1,6:,...]],None,batch_img_metas)
-    # permute_scores = results[0].permute(0,2,1)
-    # scores_level_80x80 = permute_scores[:,:,:80*80].reshape(1,-1,80,80)
-    # scores_level_40x40 = permute_scores[:,:,80*80:80*80+40*40].reshape(1,-1,40,40)
-    # scores_level_20x20 = permute_scores[:,:,80*80+40*40:80*80+40*40+20*20].reshape(1,-1,20,20)
+    permute_scores = results[0].permute(0,2,1)
+    scores_level_80x80 = permute_scores[:,:,:80*80].reshape(1,-1,80,80)
+    scores_level_40x40 = permute_scores[:,:,80*80:80*80+40*40].reshape(1,-1,40,40)
+    scores_level_20x20 = permute_scores[:,:,80*80+40*40:80*80+40*40+20*20].reshape(1,-1,20,20)
     
-    # permute_bboxes = results[1].permute(0,2,1)
-    # bboxes_level_80x80 = permute_bboxes[:,:,:80*80].reshape(1,-1,80,80)
-    # bboxes_level_40x40 = permute_bboxes[:,:,80*80:80*80+40*40].reshape(1,-1,40,40)
-    # bboxes_level_20x20 = permute_bboxes[:,:,80*80+40*40:80*80+40*40+20*20].reshape(1,-1,20,20)
+    permute_bboxes = results[1].permute(0,2,1)
+    bboxes_level_80x80 = permute_bboxes[:,:,:80*80].reshape(1,-1,80,80)
+    bboxes_level_40x40 = permute_bboxes[:,:,80*80:80*80+40*40].reshape(1,-1,40,40)
+    bboxes_level_20x20 = permute_bboxes[:,:,80*80+40*40:80*80+40*40+20*20].reshape(1,-1,20,20)
     
-    # predictions = runner.model.bbox_head.predict_by_feat([scores_level_80x80,scores_level_40x40,scores_level_20x20],[bboxes_level_80x80,bboxes_level_40x40,bboxes_level_20x20],None,batch_img_metas)
+    predictions = runner.model.bbox_head.predict_by_feat([scores_level_80x80,scores_level_40x40,scores_level_20x20],[bboxes_level_80x80,bboxes_level_40x40,bboxes_level_20x20],None,batch_img_metas)
     
-    # pred_instances = predictions[0]
-    # # print(f'topk:\nscores={results[2]}\nlabels={results[3]}\nindex={results[4]}')
-    # # global g_scores
-    # # g_scores=pred_instances
-    # keep = nms(pred_instances.bboxes, pred_instances.scores, iou_threshold=nms_thr)
-    # pred_instances = pred_instances[keep]
-    # pred_instances = pred_instances[pred_instances.scores.float() > score_thr]
+    pred_instances = predictions[0]
+    # print(f'topk:\nscores={results[2]}\nlabels={results[3]}\nindex={results[4]}')
+    # global g_scores
+    # g_scores=pred_instances
+    keep = nms(pred_instances.bboxes, pred_instances.scores, iou_threshold=nms_thr)
+    pred_instances = pred_instances[keep]
+    pred_instances = pred_instances[pred_instances.scores.float() > score_thr]
 
     # # global g_scores2
     # # g_scores2 = pred_instances
@@ -1400,27 +2512,27 @@ def export_model(runner,
     #     indices = pred_instances.scores.float().topk(max_num_boxes)[1]
     #     pred_instances = pred_instances[indices]
 
-    # pred_instances = pred_instances.cpu().numpy()
-    # detections = sv.Detections(
-    #     xyxy=pred_instances['bboxes'],
-    #     class_id=pred_instances['labels'],
-    #     confidence=pred_instances['scores']
-    # )
-    # # global g_confidence
-    # # g_confidence = detections
+    pred_instances = pred_instances.cpu().numpy()
+    detections = sv.Detections(
+        xyxy=pred_instances['bboxes'],
+        class_id=pred_instances['labels'],
+        confidence=pred_instances['scores']
+    )
+    # global g_confidence
+    # g_confidence = detections
     
-    # labels = [
-    #     f"{texts[class_id][0]} {confidence:0.2f}"
-    #     for class_id, confidence
-    #     in zip(detections.class_id, detections.confidence)
-    # ]
+    labels = [
+        f"{texts[class_id][0]} {confidence:0.2f}"
+        for class_id, confidence
+        in zip(detections.class_id, detections.confidence)
+    ]
 
-    # image = np.array(image)
-    # image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    # image = BOUNDING_BOX_ANNOTATOR.annotate(image, detections)
-    # image = LABEL_ANNOTATOR.annotate(image, detections, labels=labels)
-    # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    # image = Image.fromarray(image)
+    image = np.array(image)
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    image = BOUNDING_BOX_ANNOTATOR.annotate(image, detections)
+    image = LABEL_ANNOTATOR.annotate(image, detections, labels=labels)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(image)
     #########
     # # # load_data = torch.load("result.pt")
     # # yolow_predict = torch.load("predict.pt")    
@@ -1470,7 +2582,12 @@ def export_model(runner,
     # calibration_and_tflite(runner=runner,model=deploy_model, text=text, fake_input=fake_input_2['inputs'])
     # result, dla_file, tflite_file = mtk_calibration_and_export_tflite(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_QAT_and_export_tflite(runner=runner,model=deploy_model, text=text, test_input=fake_input)
-    result, dla_file, tflite_file = mtk_qat(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    # result, dla_file, tflite_file = mtk_qat2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    # result, dla_file, tflite_file = mtk_convert_from_onnx(runner=runner, model_file='after_quan.onnx',text=text, test_input=fake_input)
+    # result, dla_file, tflite_file = mtk_calibration_and_export_tflite2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    result, dla_file, tflite_file = mtk_calibration_and_export_tflite3(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    # compare_float_and_tflite(runner=runner, model=deploy_model, text=text, test_input=fake_input, model_dir='/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A0.4_8W16A0.3_16W16A0.3')
+    
     #############################################
     # os.makedirs('work_dirs', exist_ok=True)
     # save_onnx_path = os.path.join(
@@ -1584,7 +2701,8 @@ def export_model(runner,
     # print("Available providers:", sess.get_providers())
     # outs = sess.run(['scores','boxes','topk_scores', 'topk_classes','topk_indices','topk_bboxes'], {"images": fake_input_2['inputs'].cpu().numpy().astype(np.float32)})
     # print(outs)
-    
+    dla_file = "./work_dirs/quantized_model.dla"
+    tflite_file = "./work_dirs/quantized_model.tflite"
     del base_model
     del deploy_model
     # del onnx_model
@@ -1592,7 +2710,8 @@ def export_model(runner,
 
 
 def demo(runner, args, cfg):
-    
+    # generate_calibrattion_data(runner=runner)
+    # exit()
     with gr.Blocks(title="YOLO-World") as demo:
         with gr.Row():
             gr.Markdown('<h1><center>YOLO-World: Real-Time Open-Vocabulary '
@@ -1669,6 +2788,7 @@ def demo(runner, args, cfg):
 
 
 if __name__ == '__main__':
+
     args = parse_args()
 
     # load config
