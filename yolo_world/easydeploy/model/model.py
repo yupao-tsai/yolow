@@ -236,14 +236,15 @@ class DeployModel(nn.Module):
             # Step 1: 对每个 anchor 的最大分数进行排序（仅在 topk_indices 范围内操作）
             max_scores_per_anchor, max_class_per_anchor = torch.max(scores, dim=-1)  # shape: [1, 8400]
             max_class_per_anchor=max_class_per_anchor.reshape(-1)
-            max_scores_per_anchor = torch.clamp(max_scores_per_anchor, min=-8, max=8) 
+            # max_scores_per_anchor = torch.clamp(max_scores_per_anchor, min=-8, max=8) 
+            max_scores_per_anchor = max_scores_per_anchor.sigmoid()
             # max_class_per_anchor = torch.clamp(max_class_per_anchor, min=0, max=K)
             max_class_per_anchor = max_class_per_anchor.to(dtype=torch.uint8)
             # max_scores_per_anchor = max_scores_per_anchor.sigmoid()
             max_scores_per_anchor=max_scores_per_anchor.reshape(1,1,1,-1).to(dtype=torch.float32)         
             _, topk_indices = max_scores_per_anchor.topk(K,dim=-1)  # shape: [1, 15]
             topk_indices = topk_indices.reshape(-1)
-            topk_scores = max_scores_per_anchor.reshape(-1)[topk_indices].sigmoid()
+            topk_scores = max_scores_per_anchor.reshape(-1)[topk_indices]
             topk_classes = max_class_per_anchor[topk_indices]
             topk_bboxes = squeeze_bboxes[topk_indices,:]
             

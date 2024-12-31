@@ -1756,7 +1756,7 @@ class MyDeplyModel(DeployModel):
     def __new__(cls, name, bases, dct):
         return super().__new__(cls, name, bases, dct) 
     
-def compare_float_and_tflite2(runner, model, text, test_input, fmodel_name, model_dir=None, model_names=[]):
+def compare_float_and_tflite2(runner, model, text, test_input, fmodel_class, model_dir=None, model_names=[]):
     import onnxruntime as ort
     import mtk_converter
     # model_dir = '/storage/SSD_4T/yptsai/program/object_detection/stevengrove/work_dirs/8W8A/'
@@ -1764,12 +1764,14 @@ def compare_float_and_tflite2(runner, model, text, test_input, fmodel_name, mode
     if model_dir is None:
         model_dir = '/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A_MIX/'
     
-    SelectedClass = globals()[fmodel_name]
-    model = SelectedClass(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    # SelectedClass = globals()[fmodel_name]
+    # model = SelectedClass(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    model = fmodel_class(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
     # model = FDelopyModel2(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
     set_training(model,training=False)
-    pytorch_output = model(test_input.permute(0,2,3,1))
-    pytorch_output = [o.cpu().detach().numpy() for o in pytorch_output]
+    with torch.no_grad():
+        pytorch_output = model(test_input.permute(0,2,3,1))
+        pytorch_output = [o.cpu().detach().numpy() for o in pytorch_output]
     # print("Pytorch Inference Result:", pytorch_output)
     
     input_data = np.transpose(test_input.cpu().numpy().astype(np.float32), (0,2,3,1))
@@ -2080,11 +2082,11 @@ def mtk_calibration_and_export_tflite4(runner, model, text, test_input):
     set_training(fmodel, False)
     # move_model_to_device(fmodel,"cpu")
     # cpu_input = test_input.cpu().permute(0,2,3,1)
-    # configure = {'8W8A':0.5, '16W16A':0.5}
-    configure = {'16W16A':1.0}
+    configure = {'8W8A':0.5, '16W16A':0.5}
+    # configure = {'16W16A':1.0}
     combine = ''.join([f'{k}{v}_' for k,v in configure.items()])
     combine = combine[:-1]
-    work_dir = f'./work_dirs/{combine}/'
+    work_dir = f'./work_dirs/{combine}_4outputs_8W_sigmoid/'
     os.makedirs(work_dir, exist_ok=True)
     configure_file =f'{work_dir}/precision_config{combine}.json'    
     cpu_input = test_input.permute(0,2,3,1)    
@@ -2224,16 +2226,16 @@ def mtk_calibration_and_export_tflite4(runner, model, text, test_input):
     with open(json_file, 'w') as file:
         json.dump(data, file, indent=4)
     # "/TopK_output_1"
-    target_substrings = ["/Clip_output_0", "/Reshape_7_output_0","TopK_output_0"]
+    target_substrings = ["/Sigmoid_output_0", "/Reshape_7_output_0","TopK_output_0"]
     replace_tensor_with_new_configure(json_file, target_substrings, configure='8W8A')
-    target_substrings = ["/Reshape_9_output_0", "/Squeeze_output_0", "topk_bboxes", "/Gather_output_0", "topk_scores"]
+    target_substrings = ["/Reshape_9_output_0", "topk_scores" , "/Squeeze_output_0", "topk_bboxes"]
     replace_tensor_with_new_configure(json_file, target_substrings, configure='FP')
     converter = mtk_converter.OnnxConverter.from_model_proto_file(modified_filename, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=output_names)
     converter.quantize = True
     converter.input_value_ranges = [(0, 1)]
     converter.precision_config_file = json_file    
     converter.use_unsigned_quantization_type=True
-    num_data =1000
+    num_data =10
     converter.append_output_dequantize_ops=True
     converter.calibration_data_gen = calibration_data_function
     tflite_file = f'{work_dir}/quantized_model_modified.tflite'
@@ -2274,7 +2276,7 @@ def mtk_calibration_and_export_tflite4(runner, model, text, test_input):
     
     tflite_editor = mtk_converter.TFLiteEditor(tflite_file)
     tflite_editor.toggle_signed_or_unsigned_data_types(['images', 'images_padded_out'])
-    target_substrings = ["/Clip_output_0", "/Reshape_7_output_0", "/TopK_output_0"]
+    target_substrings = ["/Sigmoid_output_0", "/Reshape_7_output_0", "/TopK_output_0"] #+["/Reshape_9_output_0", "/Gather_output_0"]
     tflite_editor.toggle_signed_or_unsigned_data_types(target_substrings)
     tflite_file=f'{work_dir}/quantized_model_unsigned.tflite'
     tflite_editor.export(tflite_file, tflite_op_export_spec='npsdk_v7')
@@ -2315,7 +2317,7 @@ def mtk_calibration_and_export_tflite4(runner, model, text, test_input):
     del onnx_model
     del converter
     
-    compare_float_and_tflite(runner=runner, model=model, text=text, test_input=test_input, model_dir=work_dir)
+    compare_float_and_tflite2(runner=runner, model=model, text=text, test_input=test_input, fmodel_class=FDelopyModel4,model_dir=work_dir,model_names=['quantized_model_unsigned.tflite'])
     
     return (result,output_file, tflite_file)       
           
@@ -3156,9 +3158,9 @@ def export_model(runner,
     # result, dla_file, tflite_file = mtk_convert_from_onnx(runner=runner, model_file='after_quan.onnx',text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_calibration_and_export_tflite2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_calibration_and_export_tflite3(runner=runner,model=deploy_model, text=text, test_input=fake_input)
-    # result, dla_file, tflite_file = mtk_calibration_and_export_tflite4(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    result, dla_file, tflite_file = mtk_calibration_and_export_tflite4(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # compare_float_and_tflite(runner=runner, model=deploy_model, text=text, test_input=fake_input, model_dir='/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A0.4_8W16A0.3_16W16A0.3')
-    compare_float_and_tflite2(runner=runner, model=deploy_model, text=text, test_input=fake_input,fmodel_name='FDelopyModel4', model_dir='work_dirs/16W16A1.0',model_names=['quantized_model_unsigned.tflite'])
+    # compare_float_and_tflite2(runner=runner, model=deploy_model, text=text, test_input=fake_input,fmodel_class=FDelopyModel4, model_dir='work_dirs/16W16A1.0',model_names=['quantized_model_unsigned.tflite'])
     #############################################
     # os.makedirs('work_dirs', exist_ok=True)
     # save_onnx_path = os.path.join(
