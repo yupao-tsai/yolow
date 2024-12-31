@@ -39,8 +39,6 @@ class DeployModel(nn.Module):
         self.baseHead = baseModel.bbox_head
         self.backend = backend
         self.features = None
-        self.quant = torch.ao.quantization.QuantStub()
-        self.dequant = torch.ao.quantization.DeQuantStub()
         self.without_bbox_decoder = without_bbox_decoder
         self.data_norm = torch.tensor([[[[255, 255, 255]]]], dtype=torch.float32)
         
@@ -206,83 +204,73 @@ class DeployModel(nn.Module):
             return self.pred_by_feat(*neck_outputs)
         else:
             outputs = []
-            if self.transpose:
-                for feats in zip(*neck_outputs):
-                    if self.backend in (MMYOLOBackend.NCNN,
-                                        MMYOLOBackend.TORCHSCRIPT):
-                        outputs.append(
-                            torch.cat(
-                                [feat.permute(0, 2, 3, 1) for feat in feats],
-                                -1))
-                    else:
-                        outputs.append(torch.cat(feats, 1).permute(0, 2, 3, 1))
-            else:
-                # for feats in zip(*neck_outputs):
-                #     outputs.append(torch.cat(feats, 1))
-                self.num_classes = self.baseHead.num_classes
-                flatten_cls_scores = [
-                    cls_score.permute(0, 2, 3, 1).reshape(1, -1,
-                                                        self.num_classes)
-                    # cls_score.transpose(1,3).transpose(1,2).reshape(1, -1,
-                    #                                     self.num_classes)
-                    for cls_score in neck_outputs[0]
-                ]
-                flatten_bbox_preds = [
-                    bbox_pred.permute(0, 2, 3, 1).reshape(1, -1, 4)
-                    # bbox_pred.transpose(1,3).transpose(1,2).reshape(1, -1, 4)
-                    for bbox_pred in neck_outputs[1]
-                ]
-                
-                scores = torch.cat(flatten_cls_scores,1)
-                bboxes = torch.cat(flatten_bbox_preds,1)
-                score_thr = 0.05
-                nms_number = 64
-                # K = torch.tensor([1,2,4,8,16,],dtype=torch.uint8)
-                K = 64 #torch.tensor(32, dtype=torch.uint8)
-                # topk_scores, topk_labels, keep_idxs, _ = filter_scores_and_topk(
-                #     scores[0], score_thr, nms_number)
-                # values, indices = torch.topk(scores.reshape(-1), k=nms_number, dim=-1, largest=True, sorted=True)
-                
-                squeeze_scores = scores.squeeze(0)
-                squeeze_bboxes = bboxes.squeeze(0)
-                # Step 1: 对每个 anchor 的最大分数进行排序（仅在 topk_indices 范围内操作）
-                max_scores_per_anchor, max_class_per_anchor = torch.max(scores, dim=-1)  # shape: [1, 8400]
-                max_class_per_anchor=max_class_per_anchor.reshape(-1)
-                max_scores_per_anchor = torch.clamp(max_scores_per_anchor, min=-8, max=8) 
-                # max_class_per_anchor = torch.clamp(max_class_per_anchor, min=0, max=K)
-                max_class_per_anchor = max_class_per_anchor.to(dtype=torch.uint8)
-                # max_scores_per_anchor = max_scores_per_anchor.sigmoid()
-                max_scores_per_anchor2=max_scores_per_anchor.reshape(1,1,1,-1)
-                _, topk_indices = max_scores_per_anchor2.topk(K,dim=-1)  # shape: [1, 15]
-                topk_indices = topk_indices.reshape(-1)
-                topk_scores = max_scores_per_anchor.reshape(-1)[topk_indices].sigmoid()
-                topk_classes = max_class_per_anchor[topk_indices]
-                topk_bboxes = squeeze_bboxes[topk_indices,:]
-                
-                # topk_indices=topk_indices.reshape(-1)
-                # # Step 2: 仅在 topk_indices 范围内计算 sigmoid 并提取类别
-                # # 根据 topk_indices 提取 scores 的子集以减少计算量
-                
-                # selected_scores = squeeze_scores[topk_indices, :]  # shape: [15, 6]
-                # selected_sigmoid_scores = selected_scores.reshape(-1)  # 对子集计算 sigmoid，形状 [15, 6]
-                
-                # # 根据最大分数的类别索引，提取最终的分数
-                # squeeze_classes=max_class_per_anchor.squeeze(0)
-                # topk_classes = squeeze_classes[topk_indices]  # shape: [15]
-                # new_indices = torch.arange(K).to(device=topk_classes.device, dtype = torch.uint8)*selected_scores.shape[-1]+topk_classes.to(dtype=torch.uint8)
-                # new_indices = new_indices.to(dtype = torch.uint8)
-                # topk_scores = selected_sigmoid_scores[new_indices]  # shape: [15]
-                
-                # topk_bboxes = squeeze_bboxes[topk_indices,:]
-                # 如果需要扩展维度为 [1, 15]
-                # final_topk_scores = final_topk_scores.unsqueeze(0)  # shape: [1, 15]
+            
+            # for feats in zip(*neck_outputs):
+            #     outputs.append(torch.cat(feats, 1))
+            self.num_classes = self.baseHead.num_classes
+            flatten_cls_scores = [
+                cls_score.permute(0, 2, 3, 1).reshape(1, -1,
+                                                    self.num_classes)
+                # cls_score.transpose(1,3).transpose(1,2).reshape(1, -1,
+                #                                     self.num_classes)
+                for cls_score in neck_outputs[0]
+            ]
+            flatten_bbox_preds = [
+                bbox_pred.permute(0, 2, 3, 1).reshape(1, -1, 4)
+                # bbox_pred.transpose(1,3).transpose(1,2).reshape(1, -1, 4)
+                for bbox_pred in neck_outputs[1]
+            ]
+            
+            scores = torch.cat(flatten_cls_scores,1)
+            bboxes = torch.cat(flatten_bbox_preds,1)
+            score_thr = 0.05
+            nms_number = 64
+            # K = torch.tensor([1,2,4,8,16,],dtype=torch.uint8)
+            K = 64 #torch.tensor(32, dtype=torch.uint8)
+            # topk_scores, topk_labels, keep_idxs, _ = filter_scores_and_topk(
+            #     scores[0], score_thr, nms_number)
+            # values, indices = torch.topk(scores.reshape(-1), k=nms_number, dim=-1, largest=True, sorted=True)
+            
+            squeeze_scores = scores.squeeze(0)
+            squeeze_bboxes = bboxes.squeeze(0).to(dtype=torch.float32)
+            # Step 1: 对每个 anchor 的最大分数进行排序（仅在 topk_indices 范围内操作）
+            max_scores_per_anchor, max_class_per_anchor = torch.max(scores, dim=-1)  # shape: [1, 8400]
+            max_class_per_anchor=max_class_per_anchor.reshape(-1)
+            max_scores_per_anchor = torch.clamp(max_scores_per_anchor, min=-8, max=8) 
+            # max_class_per_anchor = torch.clamp(max_class_per_anchor, min=0, max=K)
+            max_class_per_anchor = max_class_per_anchor.to(dtype=torch.uint8)
+            # max_scores_per_anchor = max_scores_per_anchor.sigmoid()
+            max_scores_per_anchor=max_scores_per_anchor.reshape(1,1,1,-1).to(dtype=torch.float32)         
+            _, topk_indices = max_scores_per_anchor.topk(K,dim=-1)  # shape: [1, 15]
+            topk_indices = topk_indices.reshape(-1)
+            topk_scores = max_scores_per_anchor.reshape(-1)[topk_indices].sigmoid()
+            topk_classes = max_class_per_anchor[topk_indices]
+            topk_bboxes = squeeze_bboxes[topk_indices,:]
+            
+            # topk_indices=topk_indices.reshape(-1)
+            # # Step 2: 仅在 topk_indices 范围内计算 sigmoid 并提取类别
+            # # 根据 topk_indices 提取 scores 的子集以减少计算量
+            
+            # selected_scores = squeeze_scores[topk_indices, :]  # shape: [15, 6]
+            # selected_sigmoid_scores = selected_scores.reshape(-1)  # 对子集计算 sigmoid，形状 [15, 6]
+            
+            # # 根据最大分数的类别索引，提取最终的分数
+            # squeeze_classes=max_class_per_anchor.squeeze(0)
+            # topk_classes = squeeze_classes[topk_indices]  # shape: [15]
+            # new_indices = torch.arange(K).to(device=topk_classes.device, dtype = torch.uint8)*selected_scores.shape[-1]+topk_classes.to(dtype=torch.uint8)
+            # new_indices = new_indices.to(dtype = torch.uint8)
+            # topk_scores = selected_sigmoid_scores[new_indices]  # shape: [15]
+            
+            # topk_bboxes = squeeze_bboxes[topk_indices,:]
+            # 如果需要扩展维度为 [1, 15]
+            # final_topk_scores = final_topk_scores.unsqueeze(0)  # shape: [1, 15]
 
-                # 输出
-                outputs = [scores, bboxes, topk_scores, topk_classes, topk_indices, topk_bboxes]
-                # outputs = [self.dequant(topk_scores), self.dequant(topk_classes), self.dequant(topk_indices), self.dequant(topk_bboxes)]
-                # outputs = [topk_scores, topk_classes, topk_indices, topk_bboxes]
-                # outputs = [scores, bboxes, max_scores_per_anchor, max_class_per_anchor, topk_indices]
-                # outputs = [scores, bboxes]
+            # 输出
+            outputs = [scores, bboxes, topk_scores, topk_classes, topk_indices, topk_bboxes]
+            # outputs = [self.dequant(topk_scores), self.dequant(topk_classes), self.dequant(topk_indices), self.dequant(topk_bboxes)]
+            # outputs = [topk_scores, topk_classes, topk_indices, topk_bboxes]
+            # outputs = [scores, bboxes, max_scores_per_anchor, max_class_per_anchor, topk_indices]
+            # outputs = [scores, bboxes]
             return tuple(outputs)
 
     @staticmethod

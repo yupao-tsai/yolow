@@ -433,6 +433,15 @@ class FDelopyModel2(DeployModel):
         inputs = inputs.permute(0, 3, 1, 2) #(B, C, H, W) -> (B, H, W, C)
         outputs = super().forward(inputs)
         return (outputs[0].sigmoid(), outputs[1])
+
+class FDelopyModel4(DeployModel):
+    def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
+        super().__init__(baseModel, backend, postprocess_cfg, without_bbox_decoder)
+    
+    def forward(self, inputs):
+        inputs = inputs.permute(0, 3, 1, 2) #(B, C, H, W) -> (B, H, W, C)
+        outputs = super().forward(inputs)
+        return (outputs[2], outputs[3], outputs[4], outputs[5])
     
 class FDelopyModelUint(DeployModel):
     def __init__(self, baseModel, backend, postprocess_cfg = None, without_bbox_decoder=False):
@@ -1640,7 +1649,7 @@ def compare_float_and_tflite(runner, model, text, test_input, model_dir=None):
     if model_dir is None:
         model_dir = '/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A_MIX/'
         
-    model = FDelopyModel2(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    model = FDelopyModel4(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
     set_training(model,training=False)
     
     onnx_model_path = os.path.join(model_dir, "modified_fmodel.onnx")
@@ -1743,13 +1752,573 @@ def compare_float_and_tflite(runner, model, text, test_input, model_dir=None):
     # 比較結果
     # np.testing.assert_allclose(pytorch_output, onnx_output, rtol=1e-3, atol=1e-3)
     # np.testing.assert_allclose(pytorch_output, tflite_output, rtol=1e-3, atol=1e-3)
+class MyDeplyModel(DeployModel):
+    def __new__(cls, name, bases, dct):
+        return super().__new__(cls, name, bases, dct) 
     
-    print("All results are similar.")
+def compare_float_and_tflite2(runner, model, text, test_input, fmodel_name, model_dir=None, model_names=[]):
+    import onnxruntime as ort
+    import mtk_converter
+    # model_dir = '/storage/SSD_4T/yptsai/program/object_detection/stevengrove/work_dirs/8W8A/'
+    # model_dir = '/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/16W16A/'
+    if model_dir is None:
+        model_dir = '/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A_MIX/'
+    
+    SelectedClass = globals()[fmodel_name]
+    model = SelectedClass(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    # model = FDelopyModel2(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    set_training(model,training=False)
+    pytorch_output = model(test_input.permute(0,2,3,1))
+    pytorch_output = [o.cpu().detach().numpy() for o in pytorch_output]
+    # print("Pytorch Inference Result:", pytorch_output)
+    
+    input_data = np.transpose(test_input.cpu().numpy().astype(np.float32), (0,2,3,1))
+    
+    for m in model_names:
+        if 'onnx' in m:            
+            onnx_model_path = os.path.join(model_dir, m)
+            onnx_model = onnx.load(onnx_model_path)
+            
+            # 验证模型的结构是否有效
+            onnx.checker.check_model(onnx_model)
+            print("ONNX model is valid.")
+            
+            class InferenceSessionContext:
+                def __init__(self, model_path):
+                    self.model_path = model_path
+                    self.session = None
+
+                def __enter__(self):
+                    self.session = ort.InferenceSession(self.model_path)
+                    return self.session
+
+                def __exit__(self, exc_type, exc_value, traceback):
+                    del self.session
+                    gc.collect()
+            
+            # session = ort.InferenceSession(onnx_model_path)
+                    
+            # 初始化 ONNX Runtime 的推理会话
+            with InferenceSessionContext(onnx_model_path) as session:
+                
+
+                # 打印模型输入和输出信息
+                print("Model Inputs:")
+                for input_meta in session.get_inputs():
+                    print(f"Name: {input_meta.name}, Shape: {input_meta.shape}, Type: {input_meta.type}")
+
+                print("Model Outputs:")
+                for output_meta in session.get_outputs():
+                    print(f"Name: {output_meta.name}, Shape: {output_meta.shape}, Type: {output_meta.type}")
+
+                # 准备输入数据（根据模型的输入形状生成随机数据作为示例）
+                input_name = session.get_inputs()[0].name
+                input_shape = session.get_inputs()[0].shape
+                                
+                # 执行推理
+                output_name = [o.name for o in session.get_outputs()]
+                onnx_output = session.run(output_name, {input_name: input_data})
+
+            del onnx_model
+            gc.collect()
+            # 打印结果
+            # print("Inference Result:", onnx_output)
+            # print top 10 error values
+            print(f"Pytorch vs ONNX:{m}")
+            print(np.max(np.abs([p-o for p,o in zip(pytorch_output[0],onnx_output[0])])))
+            print(np.max(np.abs([p-o for p,o in zip(pytorch_output[1],onnx_output[1])])))
+        if 'tflite' in m:
+            # 加載 TFLite 模型
+            tflite_model_path = os.path.join(model_dir, m)
+            parser = mtk_converter.TFLiteParser(tflite_model_path)
+            info = parser.get_input_tensor_details()
+            is_quantized = 'quantization' in info[0]
+            info = parser.get_output_tensor_details()
+            output_name = [o['name'] for o in info]
+            # interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+            # interpreter.allocate_tensors()
+            interpreter = mtk_converter.TFLiteExecutor(tflite_model_path)
+            if is_quantized:
+                input_data_uint8 = (input_data * 255).astype(np.uint8)
+            else:
+                input_data_uint8 = input_data
+            
+            tflite_output = interpreter.run([input_data_uint8], output_name )
+            print(f"Pytorch vs TFLite:{m}")
+            for idx, (p, o) in enumerate(zip(pytorch_output, tflite_output)):
+                print(f'Error on {idx} output = {np.max(np.abs(p.astype(np.float32)-o.astype(np.float32)))}')
+            
+    
+def calc_error(list1, list2):
+    # 定义误差计算函数（这里以 L2 范数为例）
+    def calculate_error(vec1, vec2):
+        return np.linalg.norm(vec1 - vec2)  # L2 Norm (Euclidean distance)
+
+    if isinstance(list1[0], torch.Tensor):
+        list1_np = [t.cpu().detach().numpy() for t in list1]
+    else:
+        list1_np = list1
+        
+    if isinstance(list2[0], torch.Tensor):
+        list2_np = [t.cpu().detach().numpy() for t in list2]
+    else:
+        list2_np = list2
+        
+    # 遍历两个列表计算误差
+    errors = np.array([calculate_error(vec1, vec2) for vec1, vec2 in zip(list1_np, list2_np)])
+    print(f"Mean of Errors: {errors.mean()}")  # 输出平均误差
+    return errors.max()
     
     
+def mtk_calibration_and_export_tflite5(runner, model, text, test_input):
+    import mtk_quantization
+    import mtk_converter
     
+    fmodel = FDelopyModel2(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.TORCHSCRIPT)
+    set_training(fmodel, False)
+    output1 = fmodel(test_input.permute(0,2,3,1))
+    output2 = model(test_input)
     
+    print(f'fmode vs deploy model: \n{calc_error(output1, [output2[0].sigmoid(),output2[1]])}')
+    configure = {'8W8A':0.5, '16W16A':0.5}
+    combine = ''.join([f'{k}{v}_' for k,v in configure.items()])
+    combine = combine[:-1]
+    work_dir = f'./work_dirs/{combine}/'
+    os.makedirs(work_dir, exist_ok=True)
+    configure_file =f'{work_dir}/precision_config{combine}.json'    
     
+    pt_file = os.path.join(work_dir, 'fmodel.pt')
+    # move_model_to_device(fmodel,"cpu")
+    trace_model = torch.jit.trace(fmodel.eval(), (test_input.permute(0,2,3,1)))
+    torch.jit.save(trace_model, pt_file )
+    
+    tflite_file = os.path.join(work_dir, 'fmodel.tflite')
+    converter = mtk_converter.PyTorchConverter.from_script_module_file(pt_file , [[1, 640, 640, 3]])
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    converter.use_unsigned_quantization_type=True
+    converter.use_hessian_opt = True
+    converter.precision_proportion = configure    
+    converter.precision_config_file = configure_file
+    # _ = converter.convert_to_tflite(output_file= tflite_file, tflite_op_export_spec='npsdk_v7' )
+    
+    num_data =10
+    
+    def calibration_data_function():
+        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+
+    # 正確設置 calibration_data_gen
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = f'{work_dir}/quantized_model.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+    # 修改 tflite 模型的數據類型
+    with open(configure_file, 'r') as file:
+        data = json.load(file)
+
+    # 遍歷 JSON 資料並檢查條件
+    for precision in data.get("precision_specs", []):
+        if precision.get("precision_name") == "8W8A":
+            # 檢查 "wgt_names" 中是否有包含 "split" 的字串
+            if any("split" in name for name in precision.get("wgt_names", [])):
+                # 修改 "precision_name" 為 "16W16A"
+                precision["precision_name"] = "16W16A"
+
+    # 遍歷 JSON 資料並檢查條件
+    for precision in data.get("precision_specs", []):
+        if precision.get("precision_name") == "16W16A":
+            # 檢查 "wgt_names" 中是否有包含 "split" 的字串
+            if any("images" in name for name in precision.get("param_names", [])):
+                # 修改 "precision_name" 為 "16W16A"
+                precision["precision_name"] = "8W8A"
+                
+    # 將修改後的 JSON 資料儲存到新檔案
+    with open(configure_file, 'w') as file:
+        json.dump(data, file, indent=4)
+    
+    converter = mtk_converter.PyTorchConverter.from_script_module_file(pt_file , [[1, 640, 640, 3]], experimental_debug_tensor_names=True)
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    converter.precision_config_file = configure_file    
+    converter.use_unsigned_quantization_type=True
+    num_data =100
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = f'{work_dir}/quantized_model_modified.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+    do_dla = True
+    if do_dla:
+        # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+        # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+        output_file = f'{work_dir}/quantized_model.dla'
+        # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+        import subprocess
+
+        # 設置環境變量
+        env = {
+            "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+        }
+
+        # 命令拆分為列表
+        cmd = [
+            "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+            "--arch=mdla5.1,mvpu2.5",
+            "-O3",
+            "--show-exec-plan",
+            f"{tflite_file}",
+            "-o",
+            f"{output_file}",
+        ]
+
+        # 使用 subprocess 執行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # 打印執行結果
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        print("Return Code:", result.returncode)
+    else:
+        result = None
+    
+    tflite_editor = mtk_converter.TFLiteEditor(tflite_file)
+    tflite_editor.toggle_signed_or_unsigned_data_types(['images', 'images_padded_out'])
+    
+    tflite_file=f'{work_dir}/quantized_model_unsigned.tflite'
+    tflite_editor.export(tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+
+    do_dla = True
+    if do_dla:
+        # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+        # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+        output_file = f'{work_dir}/quantized_model_unsigned.dla'
+        # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+        import subprocess
+
+        # 設置環境變量
+        env = {
+            "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+        }
+
+        # 命令拆分為列表
+        cmd = [
+            "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+            "--arch=mdla5.1,mvpu2.5",
+            "-O3",
+            "--show-exec-plan",
+            f"{tflite_file}",
+            "-o",
+            f"{output_file}",
+        ]
+
+        # 使用 subprocess 執行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # 打印執行結果
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        print("Return Code:", result.returncode)
+    else:
+        result = None
+    del onnx_model
+    del converter
+    
+    compare_float_and_tflite2(runner=runner, model=model, text=text, test_input=test_input, model_dir=work_dir, model_names=['fmodel.tflite', 'quantized_model_unsigned.tflite'])
+    
+    return (result,output_file, tflite_file)      
+
+def replace_tensor_with_new_configure(json_file:str, target_substrings:list[str], configure='8W8A'):
+    import json
+
+    # 載入 JSON 檔案
+    with open(json_file, 'r') as file:
+        data = json.load(file)
+
+    # 新的 precision_spec
+    new_spec = {
+        "precision_name": configure,
+        "param_names": [],
+        "act_names": [],
+        "wgt_names": [],
+        "estimated_macs": 0  # 如果需要，可以計算相關值
+    }
+
+    # 遍歷所有 precision_specs，篩選並移除匹配的項目
+    for spec in data.get("precision_specs", []):
+        # 找到並移除符合條件的 param_names 和 act_names
+        matched_param_names = [name for name in spec.get("param_names", []) if any(substr in name for substr in target_substrings)]
+        matched_act_names = [name for name in spec.get("act_names", []) if any(substr in name for substr in target_substrings)]
+        matched_wgt_names = [name for name in spec.get("wgt_names", []) if any(substr in name for substr in target_substrings)]
+
+        # 添加到新的 element
+        new_spec["param_names"].extend(matched_param_names)
+        new_spec["act_names"].extend(matched_act_names)
+        new_spec["wgt_names"].extend(matched_wgt_names)
+
+        # 從原始 spec 中移除匹配的項目
+        spec["param_names"] = [name for name in spec.get("param_names", []) if name not in matched_param_names]
+        spec["act_names"] = [name for name in spec.get("act_names", []) if name not in matched_act_names]
+        spec["wgt_names"] = [name for name in spec.get("wgt_names", []) if name not in matched_wgt_names]
+
+    # 如果新 element 不為空，則加入到 precision_specs 中
+    if new_spec["param_names"] or new_spec["act_names"]:
+        data["precision_specs"].append(new_spec)
+
+    # 儲存更新後的 JSON 檔案
+    output_path = json_file
+    with open(output_path, 'w') as file:
+        json.dump(data, file, indent=4)
+
+    print(f"更新完成！{target_substrings}, 結果已儲存至 {output_path}")
+
+    
+def mtk_calibration_and_export_tflite4(runner, model, text, test_input):
+    import mtk_quantization
+    import mtk_converter
+    
+    fmodel = FDelopyModel4(baseModel=deepcopy(model.baseModel), backend=MMYOLOBackend.ONNXRUNTIME)
+    set_training(fmodel, False)
+    # move_model_to_device(fmodel,"cpu")
+    # cpu_input = test_input.cpu().permute(0,2,3,1)
+    # configure = {'8W8A':0.5, '16W16A':0.5}
+    configure = {'16W16A':1.0}
+    combine = ''.join([f'{k}{v}_' for k,v in configure.items()])
+    combine = combine[:-1]
+    work_dir = f'./work_dirs/{combine}/'
+    os.makedirs(work_dir, exist_ok=True)
+    configure_file =f'{work_dir}/precision_config{combine}.json'    
+    cpu_input = test_input.permute(0,2,3,1)    
+    os.makedirs(work_dir, exist_ok=True)
+    # example_input = 
+    with BytesIO() as f:
+        # output_names = ['num_dets', 'boxes', 'scores', 'labels']
+        output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        # output_names = ['topk_scores', 'topk_classes','topk_indices','topk_bboxes']
+        # output_names = ['scores','boxes']
+        torch.onnx.export(
+            fmodel,
+            cpu_input,
+            f,
+            input_names=['images'],
+            output_names=output_names,
+            do_constant_folding=True,
+            opset_version=13)
+        f.seek(0)
+        onnx_model = onnx.load(f)
+        onnx.checker.check_model(onnx_model)
+        onnx_model, check = onnxsim.simplify(onnx_model)
+        onnx.save(onnx_model, f"{work_dir}/fmodel.onnx")
+    #################
+    graph = onnx_model.graph
+
+    # 修改輸出名稱
+    for output in graph.output:
+        print(output.name)
+    # 遍历节点，找到 TopK 操作
+    for node in graph.node:
+        if node.op_type == "TopK":
+            print(f"Found TopK Node: {node.name}")
+            
+            # 确定 TopK 的第二个输入（k 值）的名字
+            k_input_name = node.input[1]
+            print(f"K input name: {k_input_name}")
+            
+            indices_output_name = node.output[1]
+            print(f"Indices output name: {indices_output_name}")
+            # 遍历初始化器，找到对应的 k
+            for initializer in graph.initializer:
+                if initializer.name == k_input_name:
+                    print(f"Found initializer for K: {initializer.name}")
+                    
+                    # 转换为 NumPy 数组
+                    k_array = to_array(initializer)
+                    
+                    # 检查 k 是否是形状为 [1] 的张量
+                    if k_array.shape == (1,):
+                        print(f"Original K value: {k_array}")
+
+                        # 修改为形状为 [] 的标量
+                        k_scalar = k_array.item()  # 提取标量值
+                        new_initializer = from_array(
+                            np.array(k_scalar, dtype=k_array.dtype).reshape(()),
+                            name=initializer.name
+                        )                        
+                        # 替换原来的初始化器
+                        graph.initializer.remove(initializer)
+                        graph.initializer.append(new_initializer)
+                        print(f"Modified K to scalar: {k_scalar}")
+                    
+            # 修改形状信息
+            for value_info in graph.value_info:
+                if value_info.name == k_input_name:
+                    print(f"Before modification: {value_info}")
+                    value_info.type.tensor_type.shape.dim.clear()  # 清空形状，表示标量
+                    value_info.type.tensor_type.elem_type = TensorProto.INT64  # 设置数据类型
+                    print(f"After modification: {value_info}")
+               
+    # 保存模型
+    modified_filename = f"{work_dir}/modified_fmodel.onnx"
+    onnx.save(onnx_model, modified_filename) 
+    print("Model saved as modified_model.onnx")
+    print("Model exported to ONNX.")
+    converter = mtk_converter.OnnxConverter.from_model_proto_file(modified_filename, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=output_names)
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    json_file = f'{work_dir}/precision_config{combine}.json'
+    converter.precision_config_file = json_file
+    # converter.use_hessian_opt = True
+    # converter.precision_proportion = {'16W16A':1.0}
+    # converter.precision_proportion = {'16W16A':1.0}
+    # converter.precision_proportion = {'8W16A':1.0}
+    # converter.precision_proportion = {'8W8A':1.0}
+    # converter.precision_proportion = {'8W8A':0.5, '16W16A':0.5}
+    converter.precision_proportion = configure
+    converter.use_unsigned_quantization_type=True
+    # data_reader = DataReader(generator=get_calibrattion_data(runner=runner, text=text))
+    
+    def data_gen():
+        for i in range(100):
+            yield [np.random.randn(1,640,640,3).astype(np.float32)] 
+    # # calibr_data = lambda: iter(data_reader)
+    # converter._calibration_data_gen = lambda: iter(data_reader)
+    num_data =10
+    # data_reader = DataReader(generator=get_calibrattion_data(runner, text, num_samples=num_data), data_length=num_data)
+    # 確保 DataReader 運行正常
+    # for idx, sample in enumerate(iter(data_reader)):
+    #     if idx >= 10:
+    #         break
+    #     print(f"Read sample {idx}: {sample}")
+    # generator=get_calibrattion_data(runner, text, num_samples=num_data)
+    # 包裝 calibration data 為函數
+    # num_data = 5000
+    def calibration_data_function():
+        return iter(get_calibrattion_data(runner, text, num_samples=num_data))
+
+    # 正確設置 calibration_data_gen
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = f'{work_dir}/quantized_model.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+    # 修改 tflite 模型的數據類型
+    with open(json_file, 'r') as file:
+        data = json.load(file)
+
+    # 遍歷 JSON 資料並檢查條件
+    for precision in data.get("precision_specs", []):
+        if precision.get("precision_name") == "8W8A":
+            # 檢查 "wgt_names" 中是否有包含 "split" 的字串
+            if any("split" in name for name in precision.get("wgt_names", [])):
+                # 修改 "precision_name" 為 "16W16A"
+                precision["precision_name"] = "16W16A"
+
+    # 遍歷 JSON 資料並檢查條件
+    for precision in data.get("precision_specs", []):
+        if precision.get("precision_name") == "16W16A":
+            # 檢查 "wgt_names" 中是否有包含 "split" 的字串
+            if any("images" in name for name in precision.get("param_names", [])):
+                # 修改 "precision_name" 為 "16W16A"
+                precision["precision_name"] = "8W8A"    
+    
+    # 將修改後的 JSON 資料儲存到新檔案
+    with open(json_file, 'w') as file:
+        json.dump(data, file, indent=4)
+    # "/TopK_output_1"
+    target_substrings = ["/Clip_output_0", "/Reshape_7_output_0","TopK_output_0"]
+    replace_tensor_with_new_configure(json_file, target_substrings, configure='8W8A')
+    target_substrings = ["/Reshape_9_output_0", "/Squeeze_output_0", "topk_bboxes", "/Gather_output_0", "topk_scores"]
+    replace_tensor_with_new_configure(json_file, target_substrings, configure='FP')
+    converter = mtk_converter.OnnxConverter.from_model_proto_file(modified_filename, input_names=["images"], input_shapes=[(1,640,640,3)],output_names=output_names)
+    converter.quantize = True
+    converter.input_value_ranges = [(0, 1)]
+    converter.precision_config_file = json_file    
+    converter.use_unsigned_quantization_type=True
+    num_data =1000
+    converter.append_output_dequantize_ops=True
+    converter.calibration_data_gen = calibration_data_function
+    tflite_file = f'{work_dir}/quantized_model_modified.tflite'
+    _ = converter.convert_to_tflite(output_file=tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+    # do_dla = True
+    # if do_dla:
+    #     # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+    #     # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+    #     output_file = f'{work_dir}/quantized_model.dla'
+    #     # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+    #     import subprocess
+
+    #     # 設置環境變量
+    #     env = {
+    #         "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+    #     }
+
+    #     # 命令拆分為列表
+    #     cmd = [
+    #         "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+    #         "--arch=mdla5.1,mvpu2.5",
+    #         "-O3",
+    #         "--show-exec-plan",
+    #         f"{tflite_file}",
+    #         "-o",
+    #         f"{output_file}",
+    #     ]
+
+    #     # 使用 subprocess 執行命令
+    #     result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    #     # 打印執行結果
+    #     print("STDOUT:", result.stdout)
+    #     print("STDERR:", result.stderr)
+    #     print("Return Code:", result.returncode)
+    # else:
+    #     result = None
+    
+    tflite_editor = mtk_converter.TFLiteEditor(tflite_file)
+    tflite_editor.toggle_signed_or_unsigned_data_types(['images', 'images_padded_out'])
+    target_substrings = ["/Clip_output_0", "/Reshape_7_output_0", "/TopK_output_0"]
+    tflite_editor.toggle_signed_or_unsigned_data_types(target_substrings)
+    tflite_file=f'{work_dir}/quantized_model_unsigned.tflite'
+    tflite_editor.export(tflite_file, tflite_op_export_spec='npsdk_v7')
+    
+
+    do_dla = True
+    if do_dla:
+        # output_file = f'mtk_yolow_{text.replace(",","_").replace(" ","")}'
+        # output_file = f'{output_file[:90]}{'..' if len(output_file)>90 else ''}.dla'
+        output_file = f'{work_dir}/quantized_model_unsigned.dla'
+        # cmd = f'LD_LIBRARY_PATH=neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib neuropilot-sdk-basic-8.0.5-build20241127/neuron_sdk/host/bin/ncc-tflite --arch=mdla5.1,mvpu2.5 -O3 --show-exec-plan {tflite_file} -o {output_file}'
+        import subprocess
+
+        # 設置環境變量
+        env = {
+            "LD_LIBRARY_PATH": "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/lib",
+        }
+
+        # 命令拆分為列表
+        cmd = [
+            "neuropilot-sdk-basic-7.0.8-build20240807/neuron_sdk/host/bin/ncc-tflite",
+            "--arch=mdla5.1,mvpu2.5",
+            "-O3",
+            "--show-exec-plan",
+            f"{tflite_file}",
+            "-o",
+            f"{output_file}",
+        ]
+
+        # 使用 subprocess 執行命令
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        # 打印執行結果
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        print("Return Code:", result.returncode)
+    else:
+        result = None
+    del onnx_model
+    del converter
+    
+    compare_float_and_tflite(runner=runner, model=model, text=text, test_input=test_input, model_dir=work_dir)
+    
+    return (result,output_file, tflite_file)       
+          
     
     
     
@@ -2457,7 +3026,8 @@ def export_model(runner,
     # fake_input = fake_input_2['inputs'].permute(0,2,3,1)
     # fake_input = fake_input_pipeline[:1,[2,1,0],...].permute(0,2,3,1).to(dtype=torch.float32)
     fake_input = fake_input_2['inputs']
-    results=deploy_model(fake_input)#/255)
+    with torch.no_grad():
+        results=deploy_model(fake_input)#/255)
     
     batch_img_metas = [
             data_samples.metainfo for data_samples in [data_info['data_samples']]
@@ -2585,9 +3155,10 @@ def export_model(runner,
     # result, dla_file, tflite_file = mtk_qat2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_convert_from_onnx(runner=runner, model_file='after_quan.onnx',text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_calibration_and_export_tflite2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
-    result, dla_file, tflite_file = mtk_calibration_and_export_tflite3(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    # result, dla_file, tflite_file = mtk_calibration_and_export_tflite3(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    # result, dla_file, tflite_file = mtk_calibration_and_export_tflite4(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # compare_float_and_tflite(runner=runner, model=deploy_model, text=text, test_input=fake_input, model_dir='/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A0.4_8W16A0.3_16W16A0.3')
-    
+    compare_float_and_tflite2(runner=runner, model=deploy_model, text=text, test_input=fake_input,fmodel_name='FDelopyModel4', model_dir='work_dirs/16W16A1.0',model_names=['quantized_model_unsigned.tflite'])
     #############################################
     # os.makedirs('work_dirs', exist_ok=True)
     # save_onnx_path = os.path.join(
