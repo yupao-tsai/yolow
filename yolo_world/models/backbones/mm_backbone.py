@@ -94,7 +94,7 @@ class HuggingCLIPLanguageBackbone(BaseModule):
         if not hasattr(self, 'text'):
             text = list(itertools.chain(*texts))
             # print(text)
-            # # text = ['a photo of {}'.format(x) for x in text]
+            # text = ['a photo of {}'.format(x) for x in text]
             text = self.tokenizer(text=text, return_tensors='pt', padding=True)
             # print(text)
             self.text = text.to(device=self.model.device)

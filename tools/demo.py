@@ -1478,8 +1478,9 @@ def mtk_calibration_and_export_tflite2(runner, model, text, test_input):
     import mtk_converter
     
     fmodel = FDelopyModel(baseModel=model.baseModel, backend=MMYOLOBackend.ONNXRUNTIME)
-    move_model_to_device(fmodel,"cpu")
-    cpu_input = test_input.cpu().permute(0,2,3,1)
+    set_training(fmodel,training=False)
+    # move_model_to_device(fmodel,"cpu")
+    cpu_input = test_input.permute(0,2,3,1)
     # example_input = 
     with BytesIO() as f:
         # output_names = ['num_dets', 'boxes', 'scores', 'labels']
@@ -1575,7 +1576,7 @@ def mtk_calibration_and_export_tflite2(runner, model, text, test_input):
     converter.quantize = True
     converter.input_value_ranges = [(0, 1)]
     
-    converter.precision_config_file = 'precision_config8W16A.json'
+    # converter.precision_config_file = 'precision_config8W16A.json'
     # converter.use_hessian_opt = True
     # converter.precision_proportion = {'8W16A':1.0}
     converter.use_unsigned_quantization_type=True
@@ -1639,6 +1640,7 @@ def mtk_calibration_and_export_tflite2(runner, model, text, test_input):
     
     del onnx_model
     del converter
+    compare_float_and_tflite2(runner, model, text, test_input,fmodel_class=FDelopyModel,model_dir='./work_dirs', model_names=['quantized_model.tflite'])
     return (result,output_file, tflite_file)    
 
 def compare_float_and_tflite(runner, model, text, test_input, model_dir=None):
@@ -2082,7 +2084,7 @@ def mtk_calibration_and_export_tflite4(runner, model, text, test_input):
     set_training(fmodel, False)
     # move_model_to_device(fmodel,"cpu")
     # cpu_input = test_input.cpu().permute(0,2,3,1)
-    configure = {'8W8A':0.5, '16W16A':0.5}
+    configure = {'8W8A':0.95, '16W16A':0.05}
     # configure = {'16W16A':1.0}
     combine = ''.join([f'{k}{v}_' for k,v in configure.items()])
     combine = combine[:-1]
@@ -3156,9 +3158,9 @@ def export_model(runner,
     # result, dla_file, tflite_file = mtk_QAT_and_export_tflite(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_qat2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_convert_from_onnx(runner=runner, model_file='after_quan.onnx',text=text, test_input=fake_input)
-    # result, dla_file, tflite_file = mtk_calibration_and_export_tflite2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    result, dla_file, tflite_file = mtk_calibration_and_export_tflite2(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # result, dla_file, tflite_file = mtk_calibration_and_export_tflite3(runner=runner,model=deploy_model, text=text, test_input=fake_input)
-    result, dla_file, tflite_file = mtk_calibration_and_export_tflite4(runner=runner,model=deploy_model, text=text, test_input=fake_input)
+    # result, dla_file, tflite_file = mtk_calibration_and_export_tflite4(runner=runner,model=deploy_model, text=text, test_input=fake_input)
     # compare_float_and_tflite(runner=runner, model=deploy_model, text=text, test_input=fake_input, model_dir='/storage/SSD-3/yptsai/stevengrove/yolow/work_dirs/8W8A0.4_8W16A0.3_16W16A0.3')
     # compare_float_and_tflite2(runner=runner, model=deploy_model, text=text, test_input=fake_input,fmodel_class=FDelopyModel4, model_dir='work_dirs/16W16A1.0',model_names=['quantized_model_unsigned.tflite'])
     #############################################
